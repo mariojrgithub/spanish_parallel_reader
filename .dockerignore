@@ -15,3 +15,5 @@ README.md
 docker-compose*.yml
 .env.example
 pytest.ini
+.venv/
+venv/

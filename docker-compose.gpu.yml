@@ -33,7 +33,7 @@ services:
         condition: service_healthy
     environment:
       OLLAMA_HOST: http://ollama:11434
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-aya-expanse:8b}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b}
     entrypoint: ["/bin/sh", "-c"]
     command: >
       "echo Checking $${OLLAMA_MODEL} &&
@@ -55,7 +55,8 @@ services:
       - "${APP_HOST_PORT:-8502}:8501"
     environment:
       OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-aya-expanse:8b}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b}
+      AVAILABLE_OLLAMA_MODELS: ${AVAILABLE_OLLAMA_MODELS:-qwen2.5:7b,qwen2.5:14b}
       OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
       MAX_CHARS_PER_CHUNK: ${MAX_CHARS_PER_CHUNK:-2200}
       CHECKER_ENABLED: ${CHECKER_ENABLED:-true}
