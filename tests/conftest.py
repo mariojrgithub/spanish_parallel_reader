@@ -22,7 +22,7 @@ def checker_settings_factory():
         require_pass: bool = False,
         cache_enabled: bool = True,
         timeout_seconds: float = 10.0,
-        model: str = "aya-expanse:8b",
+        model: str = "qwen2.5:7b",
         max_chars: int = 2500,
         batch_size: int = 1,
     ) -> CheckerSettings:

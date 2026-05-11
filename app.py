@@ -41,8 +41,20 @@ logger = logging.getLogger(__name__)
 # -----------------------------
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434").rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "aya-expanse:8b")
-OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "-1")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+_AVAILABLE_MODELS_RAW = os.getenv(
+    "AVAILABLE_OLLAMA_MODELS",
+    "qwen2.5:7b,qwen2.5:14b",
+)
+AVAILABLE_OLLAMA_MODELS: List[str] = [
+    m.strip() for m in _AVAILABLE_MODELS_RAW.split(",") if m.strip()
+]
+_keep_alive_raw = os.getenv("OLLAMA_KEEP_ALIVE", "-1")
+try:
+    OLLAMA_KEEP_ALIVE: int = int(_keep_alive_raw)
+except ValueError:
+    OLLAMA_KEEP_ALIVE = -1  # malformed value (e.g. "-1m") corrected to -1
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 DEFAULT_MAX_CHARS = int(os.getenv("MAX_CHARS_PER_CHUNK", "2200"))
 
 # Persistent HTTP session — reuses TCP connections across all Ollama calls.
@@ -120,14 +132,14 @@ _TRANSLATION_EXAMPLE_STR: str = json.dumps(
         "summary_spanish": "Resumen de una o dos oraciones en español.",
         "pairs": [
             {
-                "english": "Full, unabbreviated original English sentence or paragraph.",
-                "spanish": "Traducción española completa y sin abreviaciones.",
-                "literal_spanish": "Traducción literal palabra por palabra (cadena vacía si está desactivada).",
+                "english": "He ran quickly to the store before it closed.",
+                "spanish": "Corrió deprisa a la tienda antes de que cerrara.",
+                "literal_spanish": "Él corrió rápidamente a la tienda antes que ella cerrara.",
                 "vocabulary": [
-                    {"spanish": "palabra", "english": "word meaning", "note": "optional extra note"}
+                    {"spanish": "deprisa", "english": "quickly, fast", "note": "common in Spain and Latin America"}
                 ],
-                "grammar_notes": ["Full grammar observation sentence."],
-                "comprehension_question_spanish": "¿Pregunta de comprensión? (cadena vacía si está desactivada.)",
+                "grammar_notes": ["'antes de que' requires the subjunctive; 'cerrara' is imperfect subjunctive of cerrar."],
+                "comprehension_question_spanish": "¿Por qué corrió él a la tienda?",
                 "difficulty": "B1",
             }
         ],
@@ -287,8 +299,8 @@ def split_into_chunks(text: str, max_chars: int) -> List[str]:
 # Ollama helpers
 # -----------------------------
 
-@st.cache_data(ttl=30)
-def check_ollama():
+@st.cache_data(ttl=120)
+def check_ollama(model: str = OLLAMA_MODEL):
     try:
         response = _http_session.get(
             f"{OLLAMA_HOST}/api/tags",
@@ -297,17 +309,20 @@ def check_ollama():
         response.raise_for_status()
 
         models = [
-            model.get("name", "")
-            for model in response.json().get("models", [])
+            m.get("name", "")
+            for m in response.json().get("models", [])
         ]
 
-        if OLLAMA_MODEL in models:
-            return True, f"Connected to Ollama using {OLLAMA_MODEL}."
+        if model in models:
+            return True, f"Connected to Ollama using {model}."
 
+        pull_hint = (
+            f"Run: `ollama pull {model}` to download it. "
+            f"Available: {', '.join(models) or 'none'}"
+        )
         return (
             False,
-            f"Ollama is reachable, but {OLLAMA_MODEL} is not listed yet. "
-            f"Available: {', '.join(models) or 'none'}",
+            f"Ollama is reachable, but **{model}** is not listed yet. {pull_hint}",
         )
 
     except Exception as exc:
@@ -324,13 +339,14 @@ def translate_chunk(
     include_vocab: bool,
     include_grammar: bool,
     temperature: float,
+    on_token: object = None,
+    model: str | None = None,
 ) -> TranslationResponse:
     # NOTE: format is set to "json" (general JSON mode) rather than a JSON Schema
-    # object because aya-expanse and other Cohere-based models do not support
-    # Ollama structured-output (schema-constrained sampling). Passing a schema
-    # object to an incompatible model causes Ollama to return 400 Bad Request.
-    # The prompt already contains the full schema description, so the model still
-    # returns schema-conformant JSON; Pydantic validation handles minor deviations.
+    # object because some models do not support Ollama structured-output
+    # (schema-constrained sampling). The prompt contains the full schema
+    # description so the model returns schema-conformant JSON; Pydantic
+    # validation handles minor deviations.
 
     system = (
         "You are a professional English-to-Spanish translator and Spanish language tutor. "
@@ -385,8 +401,9 @@ TEXT:
         len(chunk), include_literal, include_vocab, include_grammar
     )
 
+    _model = model or OLLAMA_MODEL
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": _model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -397,13 +414,14 @@ TEXT:
         "options": {
             "temperature": temperature,
             "num_predict": num_predict,
-            "num_ctx": 8192,
+            "num_ctx": OLLAMA_NUM_CTX,
         },
     }
 
     t0 = time.monotonic()
     content = ""
     t_first_token: float | None = None
+    _last_on_token_len = 0
 
     try:
         with _http_session.post(
@@ -432,6 +450,9 @@ TEXT:
                 if token and t_first_token is None:
                     t_first_token = time.monotonic() - t0
                 content += token
+                if on_token is not None and len(content) - _last_on_token_len >= 150:
+                    on_token(len(content))
+                    _last_on_token_len = len(content)
                 if chunk_data.get("done"):
                     break
     except requests.exceptions.ConnectionError as exc:
@@ -448,7 +469,7 @@ TEXT:
     elapsed = time.monotonic() - t0
     logger.info(
         "translate_chunk: model=%s len_in=%d len_out=%d ttft=%.2fs total=%.2fs num_predict=%d",
-        OLLAMA_MODEL, len(chunk), len(content),
+        _model, len(chunk), len(content),
         t_first_token or 0.0, elapsed, num_predict,
     )
 
@@ -655,44 +676,44 @@ def _render_checker_details(
 with st.sidebar:
     st.header("Settings")
 
-    ok, status = check_ollama()
+    st.write("**Model**")
+    _default_idx = (
+        AVAILABLE_OLLAMA_MODELS.index(OLLAMA_MODEL)
+        if OLLAMA_MODEL in AVAILABLE_OLLAMA_MODELS
+        else 0
+    )
+    selected_model = st.selectbox(
+        "Ollama model",
+        AVAILABLE_OLLAMA_MODELS,
+        index=_default_idx,
+        help="qwen2.5:7b is the default. qwen2.5:14b produces higher quality but requires ~12 GB RAM.",
+    )
+
+    ok, status = check_ollama(selected_model)
 
     if ok:
         st.success(status)
     else:
         st.warning(status)
 
-    st.write("**Model**")
-    st.code(OLLAMA_MODEL)
-
     with st.expander("Model guidance"):
         st.markdown(
             """
-Default: `aya-expanse:8b` (multilingual, CC-BY-NC license).
+Default: `qwen2.5:7b` — fast, low memory, good Spanish quality.
 
-To use a different model, set `OLLAMA_MODEL` in `.env` and restart containers.
+Optional: `qwen2.5:14b` — higher quality, requires ~12 GB RAM / 10 GB+ VRAM.
 
-**Alternatives:**
-- `aya-expanse:32b` — larger, slower, higher quality
-- `qwen3:14b` — if you need a different model
-- `qwen3:8b` — smaller, faster
+To change the default, set `OLLAMA_MODEL` in `.env` and restart containers.
 
-⚠️ **Hardware:** `aya-expanse:8b` requires 8–16 GB RAM. GPU with 8 GB+ VRAM recommended for fast inference.
+Pull models before starting:
+```
+ollama pull qwen2.5:7b
+ollama pull qwen2.5:14b
+```
 
-🔒 **License:** Aya Expanse is released under CC-BY-NC (non-commercial use only). Verify compatibility before commercial deployment.
-"""
-        )
+⚠️ **Hardware:** `qwen2.5:7b` requires ~6–8 GB RAM. `qwen2.5:14b` requires ~12 GB RAM.
 
-    with st.expander("ℹ️ Model License"):
-        st.markdown(
-            """
-**Aya Expanse 8B** is released under **CC-BY-NC** (Creative Commons By-Attribution-NonCommercial).
-
-This model is for **non-commercial use only**. Personal study, education, and research are typical non-commercial uses.
-
-If you plan to use this application commercially, you must use a model with a compatible license.
-
-[Model details](https://huggingface.co/CohereForAI/aya-expanse-8b)
+🔒 **License:** Qwen2.5 is released under Apache 2.0 (commercial use allowed).
 """
         )
 
@@ -873,7 +894,7 @@ if input_mode == "Paste text":
     set_source_text(pasted)
 
     if pasted:
-        _est_chunks = len(split_into_chunks(clean_text(pasted), DEFAULT_MAX_CHARS)) if pasted.strip() else 0
+        _est_chunks = len(split_into_chunks(clean_text(pasted), max_chars)) if pasted.strip() else 0
         st.caption(
             f"{len(pasted):,} characters · ~{_est_chunks} chunk(s) at current max-chars setting"
         )
@@ -1032,10 +1053,15 @@ if _translate_clicked:
         _t_chunk_start = time.monotonic()
 
         with st.status(
-            f"Translating chunk {idx}/{len(chunks)} with {OLLAMA_MODEL}…",
+            f"Translating chunk {idx}/{len(chunks)} with {selected_model}…",
             expanded=True,
         ) as _status:
             _status.write(f"Sending {len(chunk):,} characters to model…")
+            _token_counter = st.empty()
+
+            def _update_counter(n_chars: int) -> None:
+                _token_counter.caption(f"Receiving… {n_chars:,} characters")
+
             try:
                 result = translate_chunk(
                     chunk=chunk,
@@ -1047,7 +1073,10 @@ if _translate_clicked:
                     include_vocab=include_vocab,
                     include_grammar=include_grammar,
                     temperature=temperature,
+                    on_token=_update_counter,
+                    model=selected_model,
                 )
+                _token_counter.empty()
                 _elapsed = time.monotonic() - _t_chunk_start
                 _status.update(
                     label=(
@@ -1145,6 +1174,20 @@ if st.session_state.results:
         for r in st.session_state.results
         for p in r.pairs
     )
+
+    # Pre-compute checker keys once per render; reused in tab_reader, tab_export,
+    # and the export-blocked check — avoids redundant json.dumps + SHA-256 calls.
+    _pair_check_keys: dict[int, str] = {}
+    if checker_settings.enabled and checker_settings.mode != "off":
+        for _r in st.session_state.results:
+            for _p in _r.pairs:
+                _pair_check_keys[id(_p)] = make_check_key(
+                    checker_settings,
+                    _p.english,
+                    _p.spanish,
+                    _p.literal_spanish,
+                )
+
     tab_reader, tab_spanish, tab_vocab, tab_export = st.tabs(
         [
             f"📖 Parallel Reader ({_total_pairs})",
@@ -1194,7 +1237,7 @@ if st.session_state.results:
                             unsafe_allow_html=True,
                         )
 
-                    if pair.literal_spanish and pair.literal_spanish.strip() != pair.spanish.strip():
+                    if pair.literal_spanish:
                         with st.expander("Literal Spanish"):
                             st.write(pair.literal_spanish)
 
@@ -1210,13 +1253,8 @@ if st.session_state.results:
 
                     # Checker result for this pair (only from session_state — no new call)
                     if checker_settings.enabled and checker_settings.mode != "off":
-                        _ck = make_check_key(
-                            checker_settings,
-                            pair.english,
-                            pair.spanish,
-                            pair.literal_spanish,
-                        )
-                        _cr = st.session_state.checker_results.get(_ck)
+                        _ck = _pair_check_keys.get(id(pair))
+                        _cr = st.session_state.checker_results.get(_ck) if _ck else None
                         if _cr is not None:
                             _render_checker_details(
                                 _cr,
@@ -1333,13 +1371,8 @@ if st.session_state.results:
 
                     # Append checker result block to markdown export
                     if checker_settings.enabled and checker_settings.mode != "off":
-                        _ck = make_check_key(
-                            checker_settings,
-                            pair.english,
-                            pair.spanish,
-                            pair.literal_spanish,
-                        )
-                        _cr = st.session_state.checker_results.get(_ck)
+                        _ck = _pair_check_keys.get(id(pair))
+                        _cr = st.session_state.checker_results.get(_ck) if _ck else None
                         if _cr is not None:
                             markdown += [
                                 "\n",
@@ -1354,12 +1387,7 @@ if st.session_state.results:
         # Determine if export should be blocked
         _export_blocked = checker_settings.require_pass and any(
             not st.session_state.checker_results.get(
-                make_check_key(
-                    checker_settings,
-                    pair.english,
-                    pair.spanish,
-                    pair.literal_spanish,
-                ),
+                _pair_check_keys.get(id(pair)),
                 PairCheckResult(),
             ).passed
             for result in st.session_state.results

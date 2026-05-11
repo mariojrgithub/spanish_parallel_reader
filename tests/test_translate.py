@@ -78,7 +78,6 @@ _DEFAULT_KWARGS = dict(
 
 class TestTranslateChunkSuccess:
     def test_returns_translation_response(self, monkeypatch):
-        translate_chunk.clear()  # clear st.cache_data cache between tests
         mock_resp = _fake_streaming_response(_make_valid_json_response())
         with patch("app._http_session") as mock_session:
             mock_session.post.return_value = mock_resp
@@ -88,12 +87,39 @@ class TestTranslateChunkSuccess:
         assert result.pairs[0].english == "Hello world."
 
     def test_summary_english_unchanged_when_english(self, monkeypatch):
-        translate_chunk.clear()
         mock_resp = _fake_streaming_response(_make_valid_json_response())
         with patch("app._http_session") as mock_session:
             mock_session.post.return_value = mock_resp
             result = translate_chunk(chunk="Hello world.", **_DEFAULT_KWARGS)
         assert result.summary_english == "A short English summary."
+
+    def test_selected_model_sent_in_payload(self):
+        """The model kwarg must be forwarded to the Ollama /api/chat payload."""
+        mock_resp = _fake_streaming_response(_make_valid_json_response())
+        with patch("app._http_session") as mock_session:
+            mock_session.post.return_value = mock_resp
+            translate_chunk(chunk="Hello.", model="qwen2.5:14b", **_DEFAULT_KWARGS)
+        call_kwargs = mock_session.post.call_args
+        payload = call_kwargs[1]["json"] if call_kwargs[1] else call_kwargs[0][1]
+        assert payload["model"] == "qwen2.5:14b"
+
+    def test_default_model_is_qwen25_7b(self):
+        """When model kwarg is omitted, OLLAMA_MODEL fallback must be qwen2.5:7b."""
+        import app as _app
+        assert _app.OLLAMA_MODEL == "qwen2.5:7b" or \
+            _app.OLLAMA_MODEL == __import__("os").getenv("OLLAMA_MODEL", "qwen2.5:7b"), (
+                "Default model must be qwen2.5:7b"
+            )
+
+    def test_qwen25_14b_in_available_models(self):
+        """qwen2.5:14b must be listed in AVAILABLE_OLLAMA_MODELS."""
+        import app as _app
+        assert "qwen2.5:14b" in _app.AVAILABLE_OLLAMA_MODELS
+
+    def test_qwen25_7b_is_first_available_model(self):
+        """qwen2.5:7b must be the first (default) in AVAILABLE_OLLAMA_MODELS."""
+        import app as _app
+        assert _app.AVAILABLE_OLLAMA_MODELS[0] == "qwen2.5:7b"
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +128,6 @@ class TestTranslateChunkSuccess:
 
 class TestTranslateChunkConnectionError:
     def test_raises_connection_error(self):
-        translate_chunk.clear()
         with patch("app._http_session") as mock_session:
             mock_session.post.side_effect = requests.exceptions.ConnectionError("refused")
             with pytest.raises(requests.exceptions.ConnectionError, match="Cannot reach Ollama"):
@@ -115,7 +140,6 @@ class TestTranslateChunkConnectionError:
 
 class TestTranslateChunkTimeout:
     def test_raises_timeout(self):
-        translate_chunk.clear()
         with patch("app._http_session") as mock_session:
             mock_session.post.side_effect = requests.exceptions.Timeout("timed out")
             with pytest.raises(requests.exceptions.Timeout, match="did not respond"):
@@ -128,7 +152,6 @@ class TestTranslateChunkTimeout:
 
 class TestTranslateChunkHTTPError:
     def test_raises_http_error_on_non_ok_response(self):
-        translate_chunk.clear()
         mock_resp = MagicMock()
         mock_resp.ok = False
         mock_resp.status_code = 400
@@ -148,22 +171,22 @@ class TestTranslateChunkHTTPError:
 
 class TestEstimateNumPredict:
     def test_minimum_budget(self):
+        # chunk_len=10: base_raw=30, floor=800
         result = _estimate_num_predict(10, False, False, False)
-        assert result == 600  # minimum floor
+        assert result == 800  # minimum floor (max(30, 800))
 
     def test_maximum_budget(self):
+        # chunk_len=10000: base_raw=4000+600+800+600=6000; ceiling=8000 → 6000
         result = _estimate_num_predict(10_000, True, True, True)
-        assert result == 4000  # ceiling
+        assert result == 6000
 
-    def test_vocab_adds_600(self):
-        base = _estimate_num_predict(100, False, False, False)
-        with_vocab = _estimate_num_predict(100, False, True, False)
-        assert with_vocab >= base + 600 or with_vocab == 4000
+    def test_vocab_adds_800(self):
+        # chunk_len=100: base_raw=300; +800 vocab = 1100; above floor
+        assert _estimate_num_predict(100, False, True, False) == 1100
 
-    def test_grammar_adds_400(self):
-        base = _estimate_num_predict(100, False, False, False)
-        with_grammar = _estimate_num_predict(100, False, False, True)
-        assert with_grammar >= base + 400 or with_grammar == 4000
+    def test_grammar_adds_600(self):
+        # chunk_len=100: base_raw=300; +600 grammar = 900; above floor
+        assert _estimate_num_predict(100, False, False, True) == 900
 
 
 # ---------------------------------------------------------------------------

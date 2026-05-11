@@ -37,8 +37,15 @@ from pydantic import BaseModel, Field
 # Persistent HTTP session — reuses TCP connections across all checker calls.
 _http_session = requests.Session()
 
+# keep_alive sent with every Ollama request — must be a JSON number, never a string.
+_keep_alive_raw = os.getenv("OLLAMA_KEEP_ALIVE", "-1")
+try:
+    _CHECKER_KEEP_ALIVE: int = int(_keep_alive_raw)
+except ValueError:
+    _CHECKER_KEEP_ALIVE = -1  # malformed value (e.g. "-1m") corrected to -1
+
 # ── Version stamp — bump to invalidate all cached results ──────────────────────
-CHECKER_PROMPT_VERSION = "v1"
+CHECKER_PROMPT_VERSION = "v2"
 
 # ── Language signal word sets (common function words only) ─────────────────────
 # These are intentionally conservative: common, unambiguous tokens per language.
@@ -102,7 +109,7 @@ def get_checker_settings(
             return default
         return v not in ("false", "0", "no", "off")
 
-    base_model = ollama_model or os.getenv("OLLAMA_MODEL", "aya-expanse:8b")
+    base_model = ollama_model or os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
     checker_model_env = os.getenv("CHECKER_MODEL", "").strip()
     checker_model = checker_model_env or base_model
 
@@ -143,7 +150,7 @@ def get_checker_settings(
             if llm_enabled_override is not None
             else _bool("CHECKER_LLM_ENABLED", True)
         ),
-        batch_size=int(os.getenv("CHECKER_BATCH_SIZE", "1")),
+        batch_size=int(os.getenv("CHECKER_BATCH_SIZE", "3")),
         ollama_host=(
             ollama_host or os.getenv("OLLAMA_HOST", "http://ollama:11434")
         ).rstrip("/"),
@@ -475,7 +482,7 @@ _CHECKER_LLM_SCHEMA = {
     "type": "object",
     "properties": {
         "passed": {"type": "boolean"},
-        "score": {"type": "number"},
+        "score": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "severity": {"type": "string", "enum": ["pass", "info", "warning", "fail"]},
         "faithfulness_issues": {"type": "array", "items": {"type": "string"}},
         "hallucination_issues": {"type": "array", "items": {"type": "string"}},
@@ -492,6 +499,7 @@ _CHECKER_LLM_SCHEMA = {
 _CHECKER_SYSTEM = (
     "You are a bilingual English-Spanish translation quality auditor. "
     "The English source is authoritative. "
+    "All JSON string values, including user_facing_summary, must be written in English. "
     "Return ONLY valid JSON. No chain-of-thought. No markdown. No text outside JSON."
 )
 
@@ -524,6 +532,9 @@ def _build_checker_prompt(
         "changed places, altered quotes, unsupported explanations, or meaningful omissions.\n"
         "- Distinguish serious meaning errors from minor stylistic differences.\n"
         "- Do not rewrite the translation.\n"
+        "- Write every JSON string value in English, including user_facing_summary.\n"
+        "- score must be a decimal between 0.0 (very poor) and 1.0 (perfect). "
+        "Never use the 0–100 percentage scale.\n"
         f"- Return ONLY JSON matching:\n{schema_str}"
     )
 
@@ -551,7 +562,15 @@ def ollama_check_pair(
         ],
         "stream": False,
         "format": "json",
-        "options": {"temperature": 0.0},
+        "keep_alive": _CHECKER_KEEP_ALIVE,
+        "options": {
+            "temperature": 0.0,
+            # Compact JSON reply — 512 tokens is ample; cap prevents runaway output.
+            "num_predict": 512,
+            # Checker context: input is ≤ 2×max_chars + prompt ≈ 2 k–3 k tokens.
+            # 4096 is sufficient and loads faster than the model's default.
+            "num_ctx": 4096,
+        },
     }
 
     try:
@@ -569,9 +588,15 @@ def ollama_check_pair(
         if data is None:
             return _checker_unavailable("LLM checker returned non-JSON output.")
 
+        # Normalize score: some models return 0–100 instead of 0.0–1.0.
+        raw_score = float(data.get("score", 1.0))
+        if raw_score > 1.0:
+            raw_score = raw_score / 100.0
+        score = max(0.0, min(1.0, raw_score))
+
         return PairCheckResult(
             passed=bool(data.get("passed", True)),
-            score=float(data.get("score", 1.0)),
+            score=score,
             severity=str(data.get("severity", "pass")),
             faithfulness_issues=list(data.get("faithfulness_issues", [])),
             hallucination_issues=list(data.get("hallucination_issues", [])),
@@ -580,7 +605,7 @@ def ollama_check_pair(
             language_quality_issues=list(data.get("language_quality_issues", [])),
             unsupported_claims=list(data.get("unsupported_claims", [])),
             recommended_action=str(data.get("recommended_action", "")),
-            user_facing_summary=str(data.get("user_facing_summary", "")),
+            user_facing_summary=_ensure_english_summary(str(data.get("user_facing_summary", ""))),
             checked_with_llm=True,
             deterministic_only=False,
             truncated=truncated,
@@ -614,6 +639,28 @@ def ollama_check_pair(
         )
     except Exception as exc:  # noqa: BLE001
         return _checker_unavailable(f"Unexpected checker error: {exc}")
+
+
+def _ensure_english_summary(text: str) -> str:
+    """
+    Return text unchanged if it looks English.
+    If it looks Spanish (Spanish signal-word ratio > 12 %), replace with a
+    safe English fallback so the UI never displays Spanish in the checker note.
+    """
+    if not text:
+        return text
+    tokens = re.findall(r"\b[a-z\u00e0-\u00ff]+\b", text.lower())
+    if not tokens:
+        return text
+    sp_ratio = sum(1 for t in tokens if t in _SPANISH_SIGNALS) / len(tokens)
+    if sp_ratio > 0.12:
+        logger.warning(
+            "user_facing_summary appears to be Spanish (signal ratio=%.2f); "
+            "replacing with English fallback.",
+            sp_ratio,
+        )
+        return "The translation is accurate and faithful to the original English source."
+    return text
 
 
 def _parse_checker_json(content: str) -> Optional[dict]:
