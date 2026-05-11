@@ -1,6 +1,10 @@
+import html as _html
 import json
+import logging
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Literal
 
 import fitz
@@ -10,6 +14,13 @@ import streamlit as st
 from docx import Document
 from pydantic import BaseModel, Field, ValidationError
 
+# Optional: load .env file when running locally (no-op inside Docker)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from checker import (
     PairCheckResult,
     check_pair,
@@ -18,6 +29,12 @@ from checker import (
     make_check_key,
 )
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 
 # -----------------------------
 # Configuration
@@ -25,11 +42,17 @@ from checker import (
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "aya-expanse:8b")
-OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "-1m")
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "-1")
 DEFAULT_MAX_CHARS = int(os.getenv("MAX_CHARS_PER_CHUNK", "2200"))
 
 # Persistent HTTP session — reuses TCP connections across all Ollama calls.
 _http_session = requests.Session()
+
+# Pre-compiled regex patterns — avoids recompilation on every text operation.
+_RE_PAGE_NUM = re.compile(r"\n\s*\d+\s*\n")
+_RE_HSPACE = re.compile(r"[ \t]+")
+_RE_NEWLINES = re.compile(r"\n{3,}")
+_RE_SENTENCES = re.compile(r"(?<=[.!?])\s+")
 
 Difficulty = Literal["A1", "A2", "B1", "B2", "C1", "C2"]
 
@@ -81,6 +104,44 @@ class TranslationResponse(BaseModel):
     pairs: List[ReadingPair]
 
 
+# Module-level schema constants — computed once at startup, reused in every
+# translate_chunk call. model_json_schema() + _inline_schema traversal is
+# non-trivial; hoisting eliminates the per-call overhead.
+_TRANSLATION_SCHEMA: dict = _inline_schema(TranslationResponse.model_json_schema())
+_TRANSLATION_SCHEMA_STR: str = json.dumps(_TRANSLATION_SCHEMA, ensure_ascii=False, indent=2)
+
+# Compact example used in the prompt instead of the full JSON Schema.
+# A worked-example is clearer and far shorter (~80 tokens vs ~500 for the schema),
+# leaving significantly more room in num_ctx for output.
+_TRANSLATION_EXAMPLE_STR: str = json.dumps(
+    {
+        "title": "Lesson title",
+        "summary_english": "One or two sentence English summary of the passage.",
+        "summary_spanish": "Resumen de una o dos oraciones en español.",
+        "pairs": [
+            {
+                "english": "Full, unabbreviated original English sentence or paragraph.",
+                "spanish": "Traducción española completa y sin abreviaciones.",
+                "literal_spanish": "Traducción literal palabra por palabra (cadena vacía si está desactivada).",
+                "vocabulary": [
+                    {"spanish": "palabra", "english": "word meaning", "note": "optional extra note"}
+                ],
+                "grammar_notes": ["Full grammar observation sentence."],
+                "comprehension_question_spanish": "¿Pregunta de comprensión? (cadena vacía si está desactivada.)",
+                "difficulty": "B1",
+            }
+        ],
+    },
+    ensure_ascii=False,
+)
+
+# Spanish signal tokens used by _fix_english_summary heuristic.
+_STRONG_SPANISH: frozenset = frozenset([
+    "el", "la", "los", "las", "en", "de", "que", "es", "un", "una",
+    "del", "se", "con", "por", "para", "como", "más", "pero", "su",
+])
+
+
 # -----------------------------
 # Page setup
 # -----------------------------
@@ -101,6 +162,14 @@ st.markdown(
     .small-muted {
         font-size: 0.88rem;
         color: #6b7280;
+    }
+    /* Guarantee full passage text is always visible */
+    .passage-text {
+        line-height: 1.75;
+        overflow: visible;
+        white-space: normal;
+        overflow-wrap: break-word;
+        margin: 0 0 0.25rem 0;
     }
     </style>
     """,
@@ -125,6 +194,16 @@ if "checker_results" not in st.session_state:
     # Maps cache_key -> PairCheckResult. Populated after each translation event.
     st.session_state.checker_results = {}
 
+if "abort_requested" not in st.session_state:
+    st.session_state.abort_requested = False
+
+if "_translating" not in st.session_state:
+    st.session_state._translating = False
+
+if "_cached_markdown_key" not in st.session_state:
+    st.session_state._cached_markdown_key = None
+    st.session_state._cached_markdown = None
+
 
 # -----------------------------
 # Text helpers
@@ -139,9 +218,9 @@ def set_source_text(text: str) -> None:
 
 def clean_text(text: str) -> str:
     text = text.replace("\r", "\n")
-    text = re.sub(r"\n\s*\d+\s*\n", "\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = _RE_PAGE_NUM.sub("\n", text)
+    text = _RE_HSPACE.sub(" ", text)
+    text = _RE_NEWLINES.sub("\n\n", text)
     return text.strip()
 
 
@@ -184,7 +263,7 @@ def split_into_chunks(text: str, max_chars: int) -> List[str]:
 
     for paragraph in paragraphs:
         if len(paragraph) > max_chars:
-            parts = re.split(r"(?<=[.!?])\s+", paragraph)
+            parts = _RE_SENTENCES.split(paragraph)
         else:
             parts = [paragraph]
 
@@ -261,9 +340,6 @@ def translate_chunk(
         "Do not add facts not present in the source."
     )
 
-    schema = _inline_schema(TranslationResponse.model_json_schema())
-    schema_str = json.dumps(schema, ensure_ascii=False, indent=2)
-
     user = f"""
 Create a Spanish parallel-reader lesson from the English text below.
 
@@ -281,114 +357,229 @@ Rules:
 - If fidelity is "Closest meaning", preserve source meaning and nuance over simplification.
 - If fidelity is "Simpler learner wording", simplify wording without changing facts.
 - If fidelity is "Preserve literary style", preserve imagery, rhythm, and tone when possible.
-- summary_english MUST be written in English. It is an English-language summary for the learner.
+- summary_english MUST be written entirely in English. Never write summary_english in Spanish,
+  Portuguese, or any other language. It is an English-language summary for an English-speaking
+  learner. Write it as if explaining the text to someone who has not read it yet. If uncertain,
+  begin with "Summary: " followed by an English description of the main idea.
 - summary_spanish MUST be written in Spanish. It is a Spanish-language summary for reading practice.
 - If literal Spanish is disabled, set literal_spanish to an empty string.
 - If literal Spanish is enabled, literal_spanish must be a word-for-word rendering of the English source into Spanish, preserving English word order even when it sounds awkward. It should differ visibly from the polished spanish field.
 - If vocabulary is disabled, use an empty vocabulary list.
 - If grammar notes are disabled, use an empty grammar_notes list.
 - Use CEFR values only: A1, A2, B1, B2, C1, C2.
-- You MUST use the exact field names shown in the JSON schema below. Do not rename fields.
-- Produce ONLY a single JSON object conforming exactly to this schema:
+- You MUST use the exact field names shown in the example below. Do not rename fields.
+- CRITICAL — complete text required: Every string field must contain the complete, fully written-out text.
+  Do NOT end any field value with "...", "…", "etc.", "[continues]", or any other abbreviation.
+  Do NOT summarise or shorten the English source — copy it verbatim into the "english" field.
+  If a field does not apply, use an empty string "" or empty list [], never an ellipsis.
+- Output ONLY a single valid JSON object that follows this structure exactly.
+  Replace each placeholder description with real content for the passage:
 
-{schema_str}
+{_TRANSLATION_EXAMPLE_STR}
 
 TEXT:
 {chunk}
 """
 
+    num_predict = _estimate_num_predict(
+        len(chunk), include_literal, include_vocab, include_grammar
+    )
+
     payload = {
         "model": OLLAMA_MODEL,
         "messages": [
-            {
-                "role": "system",
-                "content": system,
-            },
-            {
-                "role": "user",
-                "content": user,
-            },
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
-        "stream": False,
+        "stream": True,
         "format": "json",
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
             "temperature": temperature,
-            "num_predict": 3000,
+            "num_predict": num_predict,
+            "num_ctx": 8192,
         },
     }
 
-    response = _http_session.post(
-        f"{OLLAMA_HOST}/api/chat",
-        json=payload,
-        timeout=240,
-    )
-    if not response.ok:
-        # Surface the Ollama error body to make debugging easier
-        try:
-            detail = response.json().get("error", response.text)
-        except Exception:
-            detail = response.text
-        raise requests.exceptions.HTTPError(
-            f"{response.status_code} {response.reason} — Ollama said: {detail}",
-            response=response,
-        )
-
-    content = response.json().get("message", {}).get("content", "")
+    t0 = time.monotonic()
+    content = ""
+    t_first_token: float | None = None
 
     try:
-        return TranslationResponse.model_validate_json(content)
+        with _http_session.post(
+            f"{OLLAMA_HOST}/api/chat",
+            json=payload,
+            timeout=240,
+            stream=True,
+        ) as response:
+            if not response.ok:
+                try:
+                    detail = response.json().get("error", response.text)
+                except Exception:
+                    detail = response.text
+                raise requests.exceptions.HTTPError(
+                    f"{response.status_code} {response.reason} — Ollama said: {detail}",
+                    response=response,
+                )
+            for raw_line in response.iter_lines():
+                if not raw_line:
+                    continue
+                try:
+                    chunk_data = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                token = chunk_data.get("message", {}).get("content", "")
+                if token and t_first_token is None:
+                    t_first_token = time.monotonic() - t0
+                content += token
+                if chunk_data.get("done"):
+                    break
+    except requests.exceptions.ConnectionError as exc:
+        raise requests.exceptions.ConnectionError(
+            f"Cannot reach Ollama at {OLLAMA_HOST}. "
+            "Check that the container is running and healthy."
+        ) from exc
+    except requests.exceptions.Timeout as exc:
+        raise requests.exceptions.Timeout(
+            "Ollama did not respond within the timeout. "
+            "Try reducing the chunk size (Max chars per chunk slider) or using a faster model."
+        ) from exc
 
+    elapsed = time.monotonic() - t0
+    logger.info(
+        "translate_chunk: model=%s len_in=%d len_out=%d ttft=%.2fs total=%.2fs num_predict=%d",
+        OLLAMA_MODEL, len(chunk), len(content),
+        t_first_token or 0.0, elapsed, num_predict,
+    )
+
+    try:
+        result = TranslationResponse.model_validate_json(content)
     except ValidationError:
         start = content.find("{")
         end = content.rfind("}") + 1
-
         if start >= 0 and end > start:
-            return TranslationResponse.model_validate_json(
-                content[start:end]
+            extracted = content[start:end]
+            try:
+                result = TranslationResponse.model_validate_json(extracted)
+            except ValidationError as inner_exc:
+                # Last-resort: the model sometimes emits a string (e.g. a
+                # schema snippet like "`vocabulary`: [ { … } ]") as a pairs
+                # element instead of a proper object.  Parse the raw JSON,
+                # drop any non-object entries from pairs, and re-validate.
+                try:
+                    raw = json.loads(extracted)
+                except json.JSONDecodeError:
+                    logger.error(
+                        "TranslationResponse parse failed — invalid JSON. "
+                        "Raw content (first 300 chars): %s",
+                        content[:300],
+                    )
+                    raise inner_exc
+                raw_pairs = raw.get("pairs", [])
+                cleaned = [p for p in raw_pairs if isinstance(p, dict)]
+                if not cleaned:
+                    logger.error(
+                        "TranslationResponse parse failed — no valid pairs after "
+                        "filtering. Raw content (first 300 chars): %s",
+                        content[:300],
+                    )
+                    raise inner_exc
+                dropped = len(raw_pairs) - len(cleaned)
+                if dropped:
+                    logger.warning(
+                        "Dropped %d non-object pair(s) from model output "
+                        "(model confused schema example with data).",
+                        dropped,
+                    )
+                raw["pairs"] = cleaned
+                try:
+                    result = TranslationResponse.model_validate(raw)
+                except ValidationError:
+                    logger.error(
+                        "TranslationResponse parse failed after pair filtering. "
+                        "Raw content (first 300 chars): %s",
+                        content[:300],
+                    )
+                    raise inner_exc
+        else:
+            logger.error(
+                "TranslationResponse parse failed — no JSON object found. "
+                "Raw (first 300 chars): %s",
+                content[:300],
             )
+            raise
 
-        raise
+    # Post-process: fix summary_english if the model wrote it in Spanish.
+    result.summary_english = _fix_english_summary(result.summary_english, chunk)
+
+    # Post-process: strip any trailing ellipsis the model added as abbreviation.
+    result.summary_english = _strip_ellipsis(result.summary_english)
+    result.summary_spanish = _strip_ellipsis(result.summary_spanish)
+    for pair in result.pairs:
+        pair.english = _strip_ellipsis(pair.english)
+        pair.spanish = _strip_ellipsis(pair.spanish)
+        pair.literal_spanish = _strip_ellipsis(pair.literal_spanish)
+        pair.comprehension_question_spanish = _strip_ellipsis(pair.comprehension_question_spanish)
+        pair.grammar_notes = [_strip_ellipsis(n) for n in pair.grammar_notes]
+
+    return result
 
 
-def _summarize_english(chunk: str) -> str:
+def _estimate_num_predict(
+    chunk_len: int,
+    include_literal: bool,
+    include_vocab: bool,
+    include_grammar: bool,
+) -> int:
+    """Adaptive num_predict budget based on chunk size and enabled features."""
+    base = min(chunk_len * 3, 4000)
+    if include_literal:
+        base += 600
+    if include_vocab:
+        base += 800
+    if include_grammar:
+        base += 600
+    return min(max(base, 800), 8000)
+
+
+def _strip_ellipsis(text: str) -> str:
+    """Remove trailing '...' / '…' abbreviation markers that models add when truncating.
+
+    Strips only from the *end* of the string so legitimate mid-text ellipses
+    (e.g. quoted omissions "he said … the attacks") are preserved.
     """
-    Generate an English-language summary of the original English chunk via a
-    separate, English-only Ollama call.  Keeping this call entirely in English
-    (system prompt, instruction, and source text) prevents aya-expanse from
-    defaulting to Spanish output.
+    s = text.rstrip()
+    changed = True
+    while changed:
+        changed = False
+        for marker in ("...", "…"):
+            if s.endswith(marker):
+                s = s[: -len(marker)].rstrip()
+                changed = True
+    return s
+
+
+def _fix_english_summary(summary: str, source_chunk: str) -> str:
     """
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful assistant. "
-                    "You always respond in English, regardless of the language of the text you are summarizing."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    "Write a 2-3 sentence summary of the following English text. "
-                    "Your summary MUST be written entirely in English.\n\n"
-                    f"TEXT:\n{chunk}"
-                ),
-            },
-        ],
-        "stream": False,
-        "keep_alive": OLLAMA_KEEP_ALIVE,
-        "options": {"temperature": 0.3, "num_predict": 200},
-    }
-    response = _http_session.post(
-        f"{OLLAMA_HOST}/api/chat",
-        json=payload,
-        timeout=120,
-    )
-    if response.ok:
-        return response.json().get("message", {}).get("content", "").strip()
-    return ""
+    Return summary unchanged if it looks English.
+    If it looks Spanish (heuristic signal ratio > 12%), derive a plain-text
+    fallback from the first 1-2 sentences of the original English source.
+    """
+    if not summary:
+        return summary
+    tokens = re.findall(r"\b[a-z\u00e0-\u00ff]+\b", summary.lower())
+    if not tokens:
+        return summary
+    sp_ratio = sum(1 for t in tokens if t in _STRONG_SPANISH) / len(tokens)
+    if sp_ratio > 0.12:
+        logger.warning(
+            "summary_english appears to be Spanish (signal ratio=%.2f); "
+            "falling back to source extraction.",
+            sp_ratio,
+        )
+        sentences = _RE_SENTENCES.split(source_chunk.strip())
+        return " ".join(sentences[:2]).strip()
+    return summary
 
 
 # -----------------------------
@@ -638,6 +829,10 @@ If you plan to use this application commercially, you must use a model with a co
     if st.button("Clear session"):
         set_source_text("")
         st.session_state.checker_results = {}
+        st.session_state.abort_requested = False
+        st.session_state._translating = False
+        st.session_state._cached_markdown_key = None
+        st.session_state._cached_markdown = None
         st.session_state.pop("_last_upload_key", None)
         st.rerun()
 
@@ -676,6 +871,12 @@ if input_mode == "Paste text":
     )
 
     set_source_text(pasted)
+
+    if pasted:
+        _est_chunks = len(split_into_chunks(clean_text(pasted), DEFAULT_MAX_CHARS)) if pasted.strip() else 0
+        st.caption(
+            f"{len(pasted):,} characters · ~{_est_chunks} chunk(s) at current max-chars setting"
+        )
 
 else:
     uploaded = st.file_uploader(
@@ -799,23 +1000,42 @@ if chunks:
             if _pi < _prev_start + len(_prev_chunks):
                 st.divider()
 
-if st.button(
+_btn_col, _stop_col = st.columns([5, 1])
+_translate_clicked = _btn_col.button(
     "Translate selected chunks",
     type="primary",
     disabled=not chunks or not ok,
-):
+)
+_stop_clicked = _stop_col.button(
+    "⏹ Stop",
+    disabled=not st.session_state._translating,
+    help="Stops translation after the current chunk finishes.",
+)
+if _stop_clicked:
+    st.session_state.abort_requested = True
+
+if _translate_clicked:
+    st.session_state.abort_requested = False
+    st.session_state._translating = True
+    st.session_state._cached_markdown_key = None  # invalidate cached export
+
     start = int(start_index) - 1
     selected_chunks = chunks[start : start + chunks_to_process]
     failed_chunks = []
 
-    for idx, chunk in enumerate(
-        selected_chunks,
-        start=start + 1,
-    ):
+    for idx, chunk in enumerate(selected_chunks, start=start + 1):
+        if st.session_state.abort_requested:
+            st.warning(f"Translation stopped by user after chunk {idx - 1}.")
+            break
+
         result = None
-        with st.spinner(
-            f"Translating chunk {idx} of {len(chunks)}..."
-        ):
+        _t_chunk_start = time.monotonic()
+
+        with st.status(
+            f"Translating chunk {idx}/{len(chunks)} with {OLLAMA_MODEL}…",
+            expanded=True,
+        ) as _status:
+            _status.write(f"Sending {len(chunk):,} characters to model…")
             try:
                 result = translate_chunk(
                     chunk=chunk,
@@ -828,31 +1048,82 @@ if st.button(
                     include_grammar=include_grammar,
                     temperature=temperature,
                 )
-
-                # aya-expanse tends to write summary_english in Spanish
-                # because the whole request is Spanish-focused.  Generate it
-                # in a separate English-only call using the original source.
-                result.summary_english = _summarize_english(chunk)
-
+                _elapsed = time.monotonic() - _t_chunk_start
+                _status.update(
+                    label=(
+                        f"Chunk {idx} — {len(result.pairs)} pair(s) "
+                        f"in {_elapsed:.1f}s"
+                    ),
+                    state="complete",
+                    expanded=False,
+                )
                 st.session_state.results.append(result)
 
+            except requests.exceptions.ConnectionError as exc:
+                _status.update(label=f"Chunk {idx} — connection error", state="error")
+                st.error(
+                    f"Cannot reach Ollama at **{OLLAMA_HOST}**. "
+                    "Check that the container is running and the healthcheck is passing. "
+                    f"Detail: {exc}"
+                )
+                failed_chunks.append(idx)
+
+            except requests.exceptions.Timeout as exc:
+                _status.update(label=f"Chunk {idx} — timeout", state="error")
+                st.error(
+                    f"Chunk {idx}: Ollama did not respond within the timeout. "
+                    "Try reducing **Max characters per chunk** in the sidebar, "
+                    "or switch to a faster model. "
+                    f"Detail: {exc}"
+                )
+                failed_chunks.append(idx)
+
+            except ValidationError as exc:
+                _status.update(label=f"Chunk {idx} — parse error", state="error")
+                st.error(
+                    f"Chunk {idx}: the model returned unexpected output that could not "
+                    "be parsed. Try lowering **Model temperature** (0.05–0.1) or "
+                    "reducing chunk size. "
+                    f"Detail: {exc}"
+                )
+                failed_chunks.append(idx)
+
             except Exception as exc:
+                _status.update(label=f"Chunk {idx} — failed", state="error")
                 st.error(f"Chunk {idx} failed: {exc}")
                 failed_chunks.append(idx)
 
-        # Run checker after successful translation (not on Streamlit rerenders)
+        # Run checker after successful translation (not on Streamlit rerenders).
+        # Pairs are checked concurrently up to CHECKER_BATCH_SIZE workers.
         if result is not None and checker_settings.enabled and checker_settings.mode != "off":
-            with st.spinner(f"Checking chunk {idx}…"):
-                for _pidx, _pair in enumerate(result.pairs):
-                    _ck, _cr = check_pair(
-                        settings=checker_settings,
-                        english=_pair.english,
-                        spanish=_pair.spanish,
-                        literal_spanish=_pair.literal_spanish,
-                        pair_index=_pidx,
-                        cached_results=st.session_state.checker_results,
-                    )
-                    st.session_state.checker_results[_ck] = _cr
+            _batch = max(checker_settings.batch_size, 1)
+            with st.status(
+                f"Checking {len(result.pairs)} pair(s)…",
+                expanded=False,
+            ) as _chk_status:
+                _cached_snapshot = dict(st.session_state.checker_results)
+                with ThreadPoolExecutor(max_workers=_batch) as _pool:
+                    _futures = [
+                        _pool.submit(
+                            check_pair,
+                            settings=checker_settings,
+                            english=_pair.english,
+                            spanish=_pair.spanish,
+                            literal_spanish=_pair.literal_spanish,
+                            pair_index=_pidx,
+                            cached_results=_cached_snapshot,
+                        )
+                        for _pidx, _pair in enumerate(result.pairs)
+                    ]
+                    for _future in as_completed(_futures):
+                        _ck, _cr = _future.result()
+                        st.session_state.checker_results[_ck] = _cr
+                _chk_status.update(
+                    label=f"Checked {len(result.pairs)} pair(s)",
+                    state="complete",
+                )
+
+    st.session_state._translating = False
 
     if failed_chunks:
         st.warning(
@@ -868,11 +1139,17 @@ if st.button(
 if st.session_state.results:
     st.subheader("3. Study")
 
+    _total_pairs = sum(len(r.pairs) for r in st.session_state.results)
+    _total_vocab = sum(
+        len(p.vocabulary)
+        for r in st.session_state.results
+        for p in r.pairs
+    )
     tab_reader, tab_spanish, tab_vocab, tab_export = st.tabs(
         [
-            "📖 Parallel Reader",
-            "🇪🇸 Spanish First",
-            "🧠 Vocabulary",
+            f"📖 Parallel Reader ({_total_pairs})",
+            f"🇪🇸 Spanish First ({_total_pairs})",
+            f"🧠 Vocabulary ({_total_vocab})",
             "⬇️ Export",
         ]
     )
@@ -898,11 +1175,17 @@ if st.session_state.results:
 
                     with left:
                         st.markdown("**English**")
-                        st.write(pair.english)
+                        st.markdown(
+                            f'<p class="passage-text">{_html.escape(pair.english).replace(chr(10), "<br>")}</p>',
+                            unsafe_allow_html=True,
+                        )
 
                     with right:
                         st.markdown("**Español**")
-                        st.write(pair.spanish)
+                        st.markdown(
+                            f'<p class="passage-text">{_html.escape(pair.spanish).replace(chr(10), "<br>")}</p>',
+                            unsafe_allow_html=True,
+                        )
                         st.markdown(
                             f'<span style="background:#e0f2fe;color:#0369a1;'
                             f'padding:2px 8px;border-radius:4px;'
@@ -946,11 +1229,12 @@ if st.session_state.results:
         )
 
         for result in st.session_state.results:
-            for i, pair in enumerate(
-                result.pairs,
-                start=1,
-            ):
-                st.markdown(f"### Passage {i}")
+            if result.title:
+                st.markdown(f"### {result.title}")
+            for i, pair in enumerate(result.pairs, start=1):
+                st.markdown(
+                    f"**Passage {i} / {len(result.pairs)}**",
+                )
                 st.write(pair.spanish)
 
                 with st.expander("Reveal English"):
@@ -988,75 +1272,84 @@ if st.session_state.results:
             st.info("No vocabulary generated yet.")
 
     with tab_export:
-        markdown = []
+        # Cache the markdown string; rebuild only when results or checker data change.
+        _mk_cache_key = (
+            len(st.session_state.results),
+            len(st.session_state.checker_results),
+        )
+        if st.session_state._cached_markdown_key != _mk_cache_key:
+            markdown = []
 
-        for result in st.session_state.results:
-            if result.title:
-                markdown.append(f"# {result.title}\n")
+            for result in st.session_state.results:
+                if result.title:
+                    markdown.append(f"# {result.title}\n")
 
-            if result.summary_english:
-                markdown.append(
-                    f"**English summary:** {result.summary_english}\n"
-                )
-
-            if result.summary_spanish:
-                markdown.append(
-                    f"**Spanish summary:** {result.summary_spanish}\n"
-                )
-
-            for pair in result.pairs:
-                markdown += [
-                    "---\n",
-                    "## English\n",
-                    pair.english + "\n",
-                    "## Español\n",
-                    pair.spanish + "\n",
-                ]
-
-                if pair.literal_spanish:
-                    markdown += [
-                        "### Literal Spanish\n",
-                        pair.literal_spanish + "\n",
-                    ]
-
-                if pair.grammar_notes:
-                    markdown += ["### Grammar notes\n"]
-                    markdown += [
-                        f"- {note}"
-                        for note in pair.grammar_notes
-                    ]
-                    markdown += [""]
-
-                if pair.vocabulary:
-                    markdown += ["### Vocabulary\n"]
-                    markdown += [
-                        f"- **{vocab.spanish}** = {vocab.english}. {vocab.note}"
-                        for vocab in pair.vocabulary
-                    ]
-                    markdown += [""]
-
-                if pair.comprehension_question_spanish:
-                    markdown += [
-                        "### Comprehension question\n",
-                        pair.comprehension_question_spanish + "\n",
-                    ]
-
-                # Append checker result block to markdown export
-                if checker_settings.enabled and checker_settings.mode != "off":
-                    _ck = make_check_key(
-                        checker_settings,
-                        pair.english,
-                        pair.spanish,
-                        pair.literal_spanish,
+                if result.summary_english:
+                    markdown.append(
+                        f"**English summary:** {result.summary_english}\n"
                     )
-                    _cr = st.session_state.checker_results.get(_ck)
-                    if _cr is not None:
+
+                if result.summary_spanish:
+                    markdown.append(
+                        f"**Spanish summary:** {result.summary_spanish}\n"
+                    )
+
+                for pair in result.pairs:
+                    markdown += [
+                        "---\n",
+                        "## English\n",
+                        pair.english + "\n",
+                        "## Español\n",
+                        pair.spanish + "\n",
+                    ]
+
+                    if pair.literal_spanish:
                         markdown += [
-                            "\n",
-                            checker_markdown_block(
-                                _cr, checker_settings.detailed_diagnostics
-                            ),
+                            "### Literal Spanish\n",
+                            pair.literal_spanish + "\n",
                         ]
+
+                    if pair.grammar_notes:
+                        markdown += ["### Grammar notes\n"]
+                        markdown += [
+                            f"- {note}"
+                            for note in pair.grammar_notes
+                        ]
+                        markdown += [""]
+
+                    if pair.vocabulary:
+                        markdown += ["### Vocabulary\n"]
+                        markdown += [
+                            f"- **{vocab.spanish}** = {vocab.english}. {vocab.note}"
+                            for vocab in pair.vocabulary
+                        ]
+                        markdown += [""]
+
+                    if pair.comprehension_question_spanish:
+                        markdown += [
+                            "### Comprehension question\n",
+                            pair.comprehension_question_spanish + "\n",
+                        ]
+
+                    # Append checker result block to markdown export
+                    if checker_settings.enabled and checker_settings.mode != "off":
+                        _ck = make_check_key(
+                            checker_settings,
+                            pair.english,
+                            pair.spanish,
+                            pair.literal_spanish,
+                        )
+                        _cr = st.session_state.checker_results.get(_ck)
+                        if _cr is not None:
+                            markdown += [
+                                "\n",
+                                checker_markdown_block(
+                                    _cr, checker_settings.detailed_diagnostics
+                                ),
+                            ]
+
+            st.session_state._cached_markdown = "\n".join(markdown)
+            st.session_state._cached_markdown_key = _mk_cache_key
 
         # Determine if export should be blocked
         _export_blocked = checker_settings.require_pass and any(
@@ -1083,7 +1376,7 @@ if st.session_state.results:
         else:
             st.download_button(
                 "Download study notes Markdown",
-                "\n".join(markdown).encode("utf-8"),
+                (st.session_state._cached_markdown or "").encode("utf-8"),
                 "spanish_parallel_reader.md",
                 "text/markdown",
             )

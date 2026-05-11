@@ -8,3 +8,10 @@ __pycache__/
 .DS_Store
 *.zip
 exports/
+tests/
+benchmarks/
+README.md
+*.md
+docker-compose*.yml
+.env.example
+pytest.ini

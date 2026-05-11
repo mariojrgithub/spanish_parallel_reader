@@ -21,11 +21,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 import requests
 from pydantic import BaseModel, Field
@@ -459,7 +463,6 @@ def should_run_llm_checker(
         return True
 
     # Pseudo-random sampling, seeded by pair index for reproducibility
-    import random
     rng = random.Random(pair_index)
     return rng.random() < settings.sample_rate
 
