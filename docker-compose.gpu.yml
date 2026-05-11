@@ -1,0 +1,60 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: spanish-reader-ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: spanish-reader-ollama-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-aya-expanse:8b}
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "echo Pulling $${OLLAMA_MODEL} &&
+       ollama pull $${OLLAMA_MODEL} &&
+       echo Model ready: $${OLLAMA_MODEL}"
+    restart: "no"
+
+  app:
+    build: .
+    container_name: spanish-parallel-reader
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+    ports:
+      - "${APP_HOST_PORT:-8502}:8501"
+    environment:
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-aya-expanse:8b}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-10m}
+      MAX_CHARS_PER_CHUNK: ${MAX_CHARS_PER_CHUNK:-2200}
+
+volumes:
+  ollama_models:
