@@ -8,11 +8,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Literal
 
 import fitz
+
 import pandas as pd
 import requests
 import streamlit as st
 from docx import Document
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # Optional: load .env file when running locally (no-op inside Docker)
 try:
@@ -103,6 +104,9 @@ class VocabularyItem(BaseModel):
     note: str = ""
 
 
+_VALID_DIFFICULTIES = ("A1", "A2", "B1", "B2", "C1", "C2")
+
+
 class ReadingPair(BaseModel):
     english: str
     spanish: str
@@ -111,6 +115,26 @@ class ReadingPair(BaseModel):
     grammar_notes: List[str] = Field(default_factory=list)
     comprehension_question_spanish: str = ""
     difficulty: Difficulty = "B1"
+
+    @field_validator("difficulty", mode="before")
+    @classmethod
+    def coerce_difficulty(cls, v: object) -> str:
+        """Normalise difficulty values emitted by smaller models.
+
+        qwen2.5:3b sometimes returns lowercase ("b1"), plain level numbers
+        ("3"), or prose labels ("Intermediate").  Try an uppercase exact match
+        first; fall back to a substring scan; default to "B1".
+        """
+        if isinstance(v, str):
+            upper = v.strip().upper()
+            if upper in _VALID_DIFFICULTIES:
+                return upper
+            # Substring scan: "b1 (intermediate)" → "B1"
+            for level in _VALID_DIFFICULTIES:
+                if level in upper:
+                    return level
+        logger.warning("Unrecognised difficulty value %r — defaulting to 'B1'.", v)
+        return "B1"
 
 
 class TranslationResponse(BaseModel):
