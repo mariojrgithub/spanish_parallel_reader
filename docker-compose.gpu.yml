@@ -64,7 +64,8 @@ services:
       OLLAMA_REQUEST_TIMEOUT: ${OLLAMA_REQUEST_TIMEOUT:-240}
       MAX_CHARS_PER_CHUNK: ${MAX_CHARS_PER_CHUNK:-2200}
       CHECKER_ENABLED: ${CHECKER_ENABLED:-true}
-      CHECKER_MODE: ${CHECKER_MODE:-fast}
+      # smart: deterministic + LLM for risky/sampled pairs. GPU has the compute for it.
+      CHECKER_MODE: ${CHECKER_MODE:-smart}
       CHECKER_MODEL: ${CHECKER_MODEL:-}
       CHECKER_SAMPLE_RATE: ${CHECKER_SAMPLE_RATE:-0.5}
       CHECKER_MAX_CHARS: ${CHECKER_MAX_CHARS:-2500}
