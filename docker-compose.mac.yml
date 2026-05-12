@@ -17,8 +17,9 @@ services:
       OLLAMA_TEMPERATURE: ${OLLAMA_TEMPERATURE:-0.1}
       OLLAMA_TOP_P: ${OLLAMA_TOP_P:-0.9}
       OLLAMA_REQUEST_TIMEOUT: ${OLLAMA_REQUEST_TIMEOUT:-240}
-      # Smaller chunk size keeps the prompt+output within the 4096 ctx window on 3b.
-      MAX_CHARS_PER_CHUNK: ${MAX_CHARS_PER_CHUNK:-1200}
+      # Small chunk size limits pairs-per-request so 3b doesn't drift on later pairs.
+      # 800 chars ≈ 2–3 pairs which is within 3b's reliable working memory.
+      MAX_CHARS_PER_CHUNK: ${MAX_CHARS_PER_CHUNK:-800}
       CHECKER_ENABLED: ${CHECKER_ENABLED:-true}
       CHECKER_MODE: ${CHECKER_MODE:-fast}
       CHECKER_MODEL: ${CHECKER_MODEL:-}
