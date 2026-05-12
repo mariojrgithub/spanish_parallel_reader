@@ -480,6 +480,10 @@ TEXT:
             "top_p": OLLAMA_TOP_P,
             "num_predict": num_predict,
             "num_ctx": _dynamic_num_ctx(len(chunk), num_predict),
+            # Prevents the model from looping on tokens (e.g. "ch ch ch…").
+            # 1.15 is a mild penalty safe for JSON output; higher values can
+            # distort token probabilities and break structured output.
+            "repeat_penalty": 1.15,
         },
     }
 
@@ -632,7 +636,11 @@ def _estimate_num_predict(
         base += 800
     if include_grammar:
         base += 600
-    return min(max(base, 800), 8000)
+    # Hard cap: smaller models (3b) cannot reliably generate very long JSON and
+    # will ramble to the token limit if given too much budget, producing ~3× the
+    # input length as unparseable output.  5000 tokens (~15 k chars) is
+    # sufficient for any realistic chunk and keeps 3b output bounded.
+    return min(max(base, 800), 5000)
 
 
 def _dynamic_num_ctx(chunk_len: int, num_predict: int) -> int:

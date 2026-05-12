@@ -575,6 +575,8 @@ def ollama_check_pair(
             # Checker context: input is ≤ 2×max_chars + prompt ≈ 2 k–3 k tokens.
             # 4096 is sufficient and loads faster than the model's default.
             "num_ctx": 4096,
+            # Prevents repetition loops in smaller models (e.g. qwen2.5:3b).
+            "repeat_penalty": 1.15,
         },
     }
 
