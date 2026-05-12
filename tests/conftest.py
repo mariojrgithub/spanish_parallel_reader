@@ -125,6 +125,17 @@ def _stub_streamlit() -> None:
 
     sys.modules["streamlit"] = stub
 
+    # Stub streamlit.components and streamlit.components.v1 so that any module
+    # that does `import streamlit.components.v1 as components` (e.g. tts_component)
+    # can be imported in the test environment without a running Streamlit server.
+    _components = types.ModuleType("streamlit.components")
+    _components_v1 = types.ModuleType("streamlit.components.v1")
+    _components_v1.html = mock.MagicMock()  # type: ignore[attr-defined]
+    _components.v1 = _components_v1  # type: ignore[attr-defined]
+    stub.components = _components  # type: ignore[attr-defined]
+    sys.modules["streamlit.components"] = _components
+    sys.modules["streamlit.components.v1"] = _components_v1
+
     # Stub heavy optional imports so app.py can be collected without them.
     for mod in ("fitz", "docx", "pandas"):
         sys.modules.setdefault(mod, mock.MagicMock())

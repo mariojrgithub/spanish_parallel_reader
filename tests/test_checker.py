@@ -597,3 +597,104 @@ def test_get_checker_settings_falls_back_to_ollama_model():
     os.environ["OLLAMA_MODEL"] = "aya-expanse:8b"
     s = get_checker_settings()
     assert s.model == "aya-expanse:8b"
+
+
+# ── Merge severity: deterministic failure must not be overridden by LLM pass ──
+
+def test_merge_severity_deterministic_fail_overrides_llm_pass():
+    """
+    If the LLM says 'pass' but the deterministic checker found 'fail'
+    (e.g. Spanish identical to English), the merged result must remain 'fail'
+    and retranslation must be triggered.  Regression test for the bug where
+    LLM severity completely overwrote deterministic severity.
+    """
+    # Spanish == English → deterministic "fail"
+    identical_spanish = _GOOD_EN  # same string as English
+    llm_data = {
+        "passed": True,
+        "score": 0.95,
+        "severity": "pass",
+        "faithfulness_issues": [],
+        "hallucination_issues": [],
+        "omission_issues": [],
+        "label_issues": [],
+        "language_quality_issues": [],
+        "unsupported_claims": [],
+        "recommended_action": "",
+        "user_facing_summary": "Translation looks good.",
+    }
+    settings = _settings(mode="strict")
+    with mock.patch("checker._http_session.post", return_value=_mock_llm_response(llm_data)):
+        _, result = check_pair(
+            settings=settings,
+            english=_GOOD_EN,
+            spanish=identical_spanish,
+            cached_results={},
+        )
+    # Deterministic check detected identity → must still be fail after merge
+    assert result.severity == "fail", (
+        f"Expected 'fail' but got '{result.severity}'. "
+        "Deterministic identity-failure was silently overridden by LLM 'pass'."
+    )
+    assert result.passed is False
+    assert result.score < 1.0
+
+
+def test_merge_severity_llm_fail_overrides_deterministic_pass():
+    """
+    If the LLM finds a 'fail' issue on a pair that passed all deterministic
+    checks, the merged result must use the LLM's 'fail'.
+    """
+    llm_data = {
+        "passed": False,
+        "score": 0.2,
+        "severity": "fail",
+        "faithfulness_issues": ["Translation reverses meaning of the sentence."],
+        "hallucination_issues": [],
+        "omission_issues": [],
+        "label_issues": [],
+        "language_quality_issues": [],
+        "unsupported_claims": [],
+        "recommended_action": "Retranslate.",
+        "user_facing_summary": "Meaning reversed.",
+    }
+    settings = _settings(mode="strict")
+    with mock.patch("checker._http_session.post", return_value=_mock_llm_response(llm_data)):
+        _, result = check_pair(
+            settings=settings,
+            english=_GOOD_EN,
+            spanish=_GOOD_ES,  # clean pair — passes deterministic
+            cached_results={},
+        )
+    assert result.severity == "fail"
+    assert result.passed is False
+    assert result.score <= 0.2
+
+
+def test_merge_severity_takes_worst_when_llm_warning_det_pass():
+    """
+    LLM warning + deterministic pass → merged result is 'warning'.
+    """
+    llm_data = {
+        "passed": True,
+        "score": 0.72,
+        "severity": "warning",
+        "faithfulness_issues": ["Minor style deviation."],
+        "hallucination_issues": [],
+        "omission_issues": [],
+        "label_issues": [],
+        "language_quality_issues": [],
+        "unsupported_claims": [],
+        "recommended_action": "",
+        "user_facing_summary": "Minor warning.",
+    }
+    settings = _settings(mode="strict")
+    with mock.patch("checker._http_session.post", return_value=_mock_llm_response(llm_data)):
+        _, result = check_pair(
+            settings=settings,
+            english=_GOOD_EN,
+            spanish=_GOOD_ES,
+            cached_results={},
+        )
+    assert result.severity == "warning"
+    assert result.score <= 0.72
