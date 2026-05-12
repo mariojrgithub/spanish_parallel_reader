@@ -88,7 +88,7 @@ def _unload_model(host: str, model: str) -> None:
 
 def _translate_one(chunk: str, label: str) -> float:
     """Translate chunk, return wall-clock seconds."""
-    translate_chunk.clear()  # bust cache so actual call is made
+    # Note: translate_chunk is a plain function, not @st.cache_data, so no .clear() needed.
     t0 = time.monotonic()
     translate_chunk(
         chunk=chunk,

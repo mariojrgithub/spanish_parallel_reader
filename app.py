@@ -55,6 +55,9 @@ try:
 except ValueError:
     OLLAMA_KEEP_ALIVE = -1  # malformed value (e.g. "-1m") corrected to -1
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.1"))
+OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "0.9"))
+OLLAMA_REQUEST_TIMEOUT = int(os.getenv("OLLAMA_REQUEST_TIMEOUT", "240"))
 DEFAULT_MAX_CHARS = int(os.getenv("MAX_CHARS_PER_CHUNK", "2200"))
 
 # Persistent HTTP session — reuses TCP connections across all Ollama calls.
@@ -116,11 +119,10 @@ class TranslationResponse(BaseModel):
     pairs: List[ReadingPair]
 
 
-# Module-level schema constants — computed once at startup, reused in every
-# translate_chunk call. model_json_schema() + _inline_schema traversal is
-# non-trivial; hoisting eliminates the per-call overhead.
+# Module-level schema constant — computed once at startup.
+# _TRANSLATION_SCHEMA is kept for future structured-output use (schema-constrained
+# sampling). The prompt currently uses _TRANSLATION_EXAMPLE_STR for brevity.
 _TRANSLATION_SCHEMA: dict = _inline_schema(TranslationResponse.model_json_schema())
-_TRANSLATION_SCHEMA_STR: str = json.dumps(_TRANSLATION_SCHEMA, ensure_ascii=False, indent=2)
 
 # Compact example used in the prompt instead of the full JSON Schema.
 # A worked-example is clearer and far shorter (~80 tokens vs ~500 for the schema),
@@ -143,6 +145,22 @@ _TRANSLATION_EXAMPLE_STR: str = json.dumps(
                 "difficulty": "B1",
             }
         ],
+    },
+    ensure_ascii=False,
+)
+
+# Single-pair example used in the retranslation prompt.
+_RETRANSLATE_PAIR_EXAMPLE_STR: str = json.dumps(
+    {
+        "english": "He ran quickly to the store before it closed.",
+        "spanish": "Corrió deprisa a la tienda antes de que cerrara.",
+        "literal_spanish": "Él corrió rápidamente a la tienda antes que ella cerrara.",
+        "vocabulary": [
+            {"spanish": "deprisa", "english": "quickly, fast", "note": "common in Spain and Latin America"}
+        ],
+        "grammar_notes": ["'antes de que' requires the subjunctive; 'cerrara' is imperfect subjunctive of cerrar."],
+        "comprehension_question_spanish": "¿Por qué corrió él a la tienda?",
+        "difficulty": "B1",
     },
     ensure_ascii=False,
 )
@@ -413,6 +431,7 @@ TEXT:
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
             "temperature": temperature,
+            "top_p": OLLAMA_TOP_P,
             "num_predict": num_predict,
             "num_ctx": OLLAMA_NUM_CTX,
         },
@@ -427,7 +446,7 @@ TEXT:
         with _http_session.post(
             f"{OLLAMA_HOST}/api/chat",
             json=payload,
-            timeout=240,
+            timeout=OLLAMA_REQUEST_TIMEOUT,
             stream=True,
         ) as response:
             if not response.ok:
@@ -601,6 +620,150 @@ def _fix_english_summary(summary: str, source_chunk: str) -> str:
         sentences = _RE_SENTENCES.split(source_chunk.strip())
         return " ".join(sentences[:2]).strip()
     return summary
+
+
+# -----------------------------
+# Pair retranslation
+# -----------------------------
+
+def retranslate_pair(
+    pair: ReadingPair,
+    check_result: "PairCheckResult",
+    level: str,
+    style: str,
+    region: str,
+    fidelity: str,
+    include_literal: bool,
+    include_vocab: bool,
+    include_grammar: bool,
+    temperature: float,
+    model: str | None = None,
+) -> ReadingPair:
+    """
+    Re-translate a single pair that failed quality checks.
+
+    Passes the original English, the rejected Spanish, and the specific issues
+    back to the model so it can produce a corrected translation.
+    The original English is always preserved verbatim in the returned pair.
+    """
+    all_issues = [
+        issue
+        for group in (
+            check_result.faithfulness_issues,
+            check_result.hallucination_issues,
+            check_result.omission_issues,
+            check_result.label_issues,
+            check_result.language_quality_issues,
+            check_result.unsupported_claims,
+        )
+        for issue in group
+    ]
+    issues_text = (
+        "\n".join(f"- {i}" for i in all_issues)
+        if all_issues
+        else "- General translation quality issue detected."
+    )
+
+    system = (
+        "You are a professional English-to-Spanish translator and Spanish language tutor. "
+        "Prioritize accurate meaning transfer, natural Spanish, register preservation, and learner usefulness. "
+        "Return only valid JSON matching the provided schema. "
+        "Do not include Markdown, XML, chain-of-thought, or commentary outside JSON. "
+        "Do not add facts not present in the source."
+    )
+
+    user = f"""
+A previous Spanish translation of the English sentence below was rejected by a quality checker.
+Produce a corrected translation that fixes every listed issue.
+
+Learner level: {level}
+Spanish region preference: {region}
+Translation style: {style}
+Translation fidelity: {fidelity}
+Include literal Spanish: {include_literal}
+Include vocabulary: {include_vocab}
+Include grammar notes: {include_grammar}
+
+ENGLISH SOURCE (copy verbatim into the "english" field):
+{pair.english}
+
+PREVIOUS SPANISH TRANSLATION (rejected — do NOT copy or reuse it):
+{pair.spanish}
+
+ISSUES FOUND IN PREVIOUS TRANSLATION:
+{issues_text}
+
+Rules:
+- Fix every issue listed above.
+- The "english" field must contain the original English text exactly as shown above.
+- Translate into natural Spanish suitable for the selected level and region.
+- If fidelity is "Closest meaning", preserve source meaning and nuance over simplification.
+- If fidelity is "Simpler learner wording", simplify wording without changing facts.
+- If fidelity is "Preserve literary style", preserve imagery, rhythm, and tone when possible.
+- If literal Spanish is disabled ({not include_literal}), set literal_spanish to an empty string.
+- If literal Spanish is enabled, literal_spanish must be a word-for-word rendering of the English into Spanish, preserving English word order even when it sounds awkward.
+- If vocabulary is disabled ({not include_vocab}), use an empty vocabulary list.
+- If grammar notes are disabled ({not include_grammar}), use an empty grammar_notes list.
+- Use CEFR values only: A1, A2, B1, B2, C1, C2.
+- CRITICAL — complete text required: every string field must be fully written out.
+  Do NOT end any field with "...", "…", or any abbreviation.
+- Output ONLY a single valid JSON object matching this structure exactly:
+
+{_RETRANSLATE_PAIR_EXAMPLE_STR}
+"""
+
+    _model = model or OLLAMA_MODEL
+    num_predict = _estimate_num_predict(
+        len(pair.english), include_literal, include_vocab, include_grammar
+    )
+
+    payload = {
+        "model": _model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "stream": False,
+        "format": "json",
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "options": {
+            "temperature": temperature,
+            "top_p": OLLAMA_TOP_P,
+            "num_predict": num_predict,
+            "num_ctx": OLLAMA_NUM_CTX,
+        },
+    }
+
+    resp = _http_session.post(
+        f"{OLLAMA_HOST}/api/chat",
+        json=payload,
+        timeout=OLLAMA_REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    content = resp.json().get("message", {}).get("content", "")
+
+    try:
+        new_pair = ReadingPair.model_validate_json(content)
+    except ValidationError:
+        start = content.find("{")
+        end = content.rfind("}") + 1
+        if start >= 0 and end > start:
+            new_pair = ReadingPair.model_validate_json(content[start:end])
+        else:
+            raise
+
+    # Post-process: strip ellipsis abbreviations.
+    new_pair.spanish = _strip_ellipsis(new_pair.spanish)
+    new_pair.literal_spanish = _strip_ellipsis(new_pair.literal_spanish)
+    new_pair.comprehension_question_spanish = _strip_ellipsis(
+        new_pair.comprehension_question_spanish
+    )
+    new_pair.grammar_notes = [_strip_ellipsis(n) for n in new_pair.grammar_notes]
+
+    # Always preserve the original English verbatim — the model must not alter it.
+    new_pair.english = pair.english
+
+    return new_pair
 
 
 # -----------------------------
@@ -789,7 +952,7 @@ ollama pull qwen2.5:14b
         "Model temperature",
         0.0,
         0.3,
-        0.1,
+        OLLAMA_TEMPERATURE,
         step=0.05,
         help="Lower = more consistent JSON output. Keep below 0.3 for reliable structured translation.",
     )
@@ -810,14 +973,36 @@ ollama pull qwen2.5:14b
     )
 
     with st.expander("🔍 Output Checker"):
+        # Derive sidebar defaults from env vars so Docker/local overrides take effect
+        # on first render. Subsequent renders use Streamlit's widget session state.
+        _env_checker_enabled = os.getenv("CHECKER_ENABLED", "true").strip().lower() not in (
+            "false", "0", "no", "off"
+        )
+        _env_checker_mode = os.getenv("CHECKER_MODE", "smart").strip().lower()
+        _checker_mode_options = ["off", "fast", "smart", "strict"]
+        _env_checker_mode_idx = (
+            _checker_mode_options.index(_env_checker_mode)
+            if _env_checker_mode in _checker_mode_options
+            else 2
+        )
+        _env_checker_llm = os.getenv("CHECKER_LLM_ENABLED", "true").strip().lower() not in (
+            "false", "0", "no", "off"
+        )
+        _env_checker_require_pass = os.getenv("CHECKER_REQUIRE_PASS", "false").strip().lower() not in (
+            "false", "0", "no", "off"
+        )
+        _env_checker_detailed = os.getenv("CHECKER_DETAILED_DIAGNOSTICS", "false").strip().lower() not in (
+            "false", "0", "no", "off"
+        )
+
         checker_enabled_ui = st.checkbox(
             "Enable output checker",
-            value=True,
+            value=_env_checker_enabled,
         )
         checker_mode_ui = st.selectbox(
             "Checker mode",
-            ["off", "fast", "smart", "strict"],
-            index=2,
+            _checker_mode_options,
+            index=_env_checker_mode_idx,
             help=(
                 "off: no checks. "
                 "fast: deterministic checks only (no extra model calls). "
@@ -833,17 +1018,17 @@ ollama pull qwen2.5:14b
         )
         checker_require_pass_ui = st.checkbox(
             "Require checker pass before export",
-            value=False,
+            value=_env_checker_require_pass,
             help="Block Markdown export for pairs that fail the checker.",
         )
         checker_llm_ui = st.checkbox(
             "LLM checker enabled",
-            value=True,
+            value=_env_checker_llm,
             help="Uncheck to use deterministic checks only (no additional model calls).",
         )
         checker_detailed_ui = st.checkbox(
             "Show detailed diagnostics",
-            value=False,
+            value=_env_checker_detailed,
             help="Show per-issue breakdown. Keep off for a faster, cleaner UI.",
         )
 
@@ -1152,6 +1337,70 @@ if _translate_clicked:
                     state="complete",
                 )
 
+        # Retranslate any pairs the checker marked as failed.
+        # Only one retry attempt per pair to avoid infinite loops.
+        if result is not None and checker_settings.enabled and checker_settings.mode != "off":
+            _pairs_to_retry = []
+            for _pidx, _pair in enumerate(result.pairs):
+                _ck = make_check_key(
+                    checker_settings,
+                    _pair.english,
+                    _pair.spanish,
+                    _pair.literal_spanish,
+                )
+                _cr = st.session_state.checker_results.get(_ck)
+                if _cr is not None and _cr.severity in ("warning", "fail"):
+                    _pairs_to_retry.append((_pidx, _pair, _ck, _cr))
+
+            if _pairs_to_retry:
+                with st.status(
+                    f"Correcting {len(_pairs_to_retry)} failed pair(s)…",
+                    expanded=True,
+                ) as _retry_status:
+                    for _pidx, _pair, _old_ck, _cr in _pairs_to_retry:
+                        _retry_status.write(
+                            f"Pair {_pidx + 1}: {_cr.user_facing_summary}"
+                        )
+                        try:
+                            _new_pair = retranslate_pair(
+                                pair=_pair,
+                                check_result=_cr,
+                                level=level,
+                                style=style,
+                                region=region,
+                                fidelity=fidelity,
+                                include_literal=include_literal,
+                                include_vocab=include_vocab,
+                                include_grammar=include_grammar,
+                                temperature=temperature,
+                                model=selected_model,
+                            )
+                            result.pairs[_pidx] = _new_pair
+                            # Remove stale checker result and re-check the corrected pair.
+                            st.session_state.checker_results.pop(_old_ck, None)
+                            _new_ck, _new_cr = check_pair(
+                                settings=checker_settings,
+                                english=_new_pair.english,
+                                spanish=_new_pair.spanish,
+                                literal_spanish=_new_pair.literal_spanish,
+                                pair_index=_pidx,
+                                cached_results={},  # force fresh check
+                            )
+                            st.session_state.checker_results[_new_ck] = _new_cr
+                        except Exception as _retry_exc:
+                            logger.warning(
+                                "Retranslation failed for pair %d: %s",
+                                _pidx,
+                                _retry_exc,
+                            )
+                            _retry_status.write(
+                                f"  ⚠️ Correction attempt failed: {_retry_exc}"
+                            )
+                    _retry_status.update(
+                        label=f"Corrected {len(_pairs_to_retry)} pair(s)",
+                        state="complete",
+                    )
+
     st.session_state._translating = False
 
     if failed_chunks:
@@ -1237,7 +1486,7 @@ if st.session_state.results:
                             unsafe_allow_html=True,
                         )
 
-                    if pair.literal_spanish:
+                    if include_literal and pair.literal_spanish:
                         with st.expander("Literal Spanish"):
                             st.write(pair.literal_spanish)
 
@@ -1341,7 +1590,7 @@ if st.session_state.results:
                         pair.spanish + "\n",
                     ]
 
-                    if pair.literal_spanish:
+                    if include_literal and pair.literal_spanish:
                         markdown += [
                             "### Literal Spanish\n",
                             pair.literal_spanish + "\n",

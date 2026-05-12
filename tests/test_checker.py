@@ -309,7 +309,7 @@ def test_mocked_llm_checker_pass():
         "user_facing_summary": "Translation looks good.",
     }
     settings = _settings(mode="strict")  # strict → always LLM
-    with mock.patch("requests.post", return_value=_mock_llm_response(llm_data)):
+    with mock.patch("checker._http_session.post", return_value=_mock_llm_response(llm_data)):
         _, result = check_pair(
             settings=settings,
             english=_GOOD_EN,
@@ -336,7 +336,7 @@ def test_mocked_llm_checker_fail():
         "user_facing_summary": "Hallucination detected.",
     }
     settings = _settings(mode="strict")
-    with mock.patch("requests.post", return_value=_mock_llm_response(llm_data)):
+    with mock.patch("checker._http_session.post", return_value=_mock_llm_response(llm_data)):
         _, result = check_pair(
             settings=settings,
             english=_GOOD_EN,

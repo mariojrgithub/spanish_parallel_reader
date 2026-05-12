@@ -89,6 +89,9 @@ AVAILABLE_OLLAMA_MODELS=qwen2.5:7b,qwen2.5:14b
 | `OLLAMA_HOST` | `http://ollama:11434` (Docker) / `http://localhost:11434` (local) | Ollama API endpoint |
 | `OLLAMA_KEEP_ALIVE` | `-1` | Keep model in memory indefinitely |
 | `OLLAMA_NUM_CTX` | `8192` | Context window in tokens |
+| `OLLAMA_TEMPERATURE` | `0.1` | Translation temperature (lower = more deterministic JSON output) |
+| `OLLAMA_TOP_P` | `0.9` | Top-p nucleus sampling for translation |
+| `OLLAMA_REQUEST_TIMEOUT` | `240` | Timeout in seconds for Ollama translation calls |
 | `MAX_CHARS_PER_CHUNK` | `2200` | Max characters per translation chunk |
 | `APP_HOST_PORT` | `8502` | Host port for the Streamlit app |
 
@@ -236,7 +239,7 @@ The checker model must already be pulled in Ollama.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CHECKER_ENABLED` | `true` | Enable or disable the checker entirely. |
-| `CHECKER_MODE` | `smart` | `off` / `fast` / `smart` / `strict` |
+| `CHECKER_MODE` | `smart` | `off` / `fast` / `smart` / `strict`. The sidebar defaults to this value on first load, so Docker deployments respect `CHECKER_MODE=fast` without any user action. |
 | `CHECKER_MODEL` | *(empty — uses OLLAMA_MODEL)* | Override the model used for LLM checking. |
 | `CHECKER_SAMPLE_RATE` | `1.0` | Fraction of low-risk pairs to LLM-check in smart mode. |
 | `CHECKER_MAX_CHARS` | `2500` | Max characters sent per field to the LLM checker. |
