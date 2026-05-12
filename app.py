@@ -235,6 +235,11 @@ if "_cached_markdown_key" not in st.session_state:
     st.session_state._cached_markdown_key = None
     st.session_state._cached_markdown = None
 
+if "_translation_cache" not in st.session_state:
+    # Maps (chunk, model, level, style, region, fidelity, flags, temp) → TranslationResponse.
+    # Prevents re-running inference for identical inputs within a session.
+    st.session_state._translation_cache = {}
+
 
 # -----------------------------
 # Text helpers
@@ -246,6 +251,7 @@ def set_source_text(text: str) -> None:
     if cleaned != st.session_state.raw_text:
         st.session_state.raw_text = cleaned
         st.session_state.results = []
+        st.session_state._translation_cache = {}
 
 def clean_text(text: str) -> str:
     text = text.replace("\r", "\n")
@@ -358,6 +364,35 @@ def check_ollama(model: str = OLLAMA_MODEL):
         return False, f"Could not reach Ollama at {OLLAMA_HOST}: {exc}"
 
 
+@st.cache_resource
+def warmup_model(model: str) -> None:
+    """Pre-load the model into Ollama memory with a 1-token request.
+
+    @st.cache_resource ensures this runs at most once per model per app
+    restart.  Executes in a daemon thread so it never blocks the UI.
+    """
+    import threading
+
+    def _ping() -> None:
+        try:
+            _http_session.post(
+                f"{OLLAMA_HOST}/api/chat",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                    "keep_alive": OLLAMA_KEEP_ALIVE,
+                    "options": {"num_predict": 1},
+                },
+                timeout=30,
+            )
+            logger.info("warmup_model: %s pre-loaded", model)
+        except Exception as exc:
+            logger.debug("warmup_model: skipped (%s)", exc)
+
+    threading.Thread(target=_ping, daemon=True).start()
+
+
 def translate_chunk(
     chunk: str,
     level: str,
@@ -444,7 +479,7 @@ TEXT:
             "temperature": temperature,
             "top_p": OLLAMA_TOP_P,
             "num_predict": num_predict,
-            "num_ctx": OLLAMA_NUM_CTX,
+            "num_ctx": _dynamic_num_ctx(len(chunk), num_predict),
         },
     }
 
@@ -598,6 +633,16 @@ def _estimate_num_predict(
     if include_grammar:
         base += 600
     return min(max(base, 800), 8000)
+
+
+def _dynamic_num_ctx(chunk_len: int, num_predict: int) -> int:
+    """Smallest sufficient num_ctx for this chunk; always a power of 2 in [2048, OLLAMA_NUM_CTX]."""
+    # ~4 chars/token; system + user prompt overhead ~600 tokens.
+    estimated = (chunk_len // 4) + num_predict + 600
+    ctx = 2048
+    while ctx < estimated:
+        ctx <<= 1
+    return min(ctx, OLLAMA_NUM_CTX)
 
 
 def _strip_ellipsis(text: str) -> str:
@@ -887,13 +932,14 @@ with st.sidebar:
         "Ollama model",
         AVAILABLE_OLLAMA_MODELS,
         index=_default_idx,
-        help="qwen2.5:7b is the default. qwen2.5:14b produces higher quality but requires ~12 GB RAM.",
+        help="qwen2.5:3b is fastest on CPU. qwen2.5:7b is the default. qwen2.5:14b is highest quality.",
     )
 
     ok, status = check_ollama(selected_model)
 
     if ok:
         st.success(status)
+        warmup_model(selected_model)
     else:
         st.warning(status)
 
@@ -902,17 +948,20 @@ with st.sidebar:
             """
 Default: `qwen2.5:7b` — fast, low memory, good Spanish quality.
 
+CPU-only: `qwen2.5:3b` — ~2× faster than 7b on CPU; modest quality reduction.
+
 Optional: `qwen2.5:14b` — higher quality, requires ~12 GB RAM / 10 GB+ VRAM.
 
 To change the default, set `OLLAMA_MODEL` in `.env` and restart containers.
 
 Pull models before starting:
 ```
+ollama pull qwen2.5:3b
 ollama pull qwen2.5:7b
 ollama pull qwen2.5:14b
 ```
 
-⚠️ **Hardware:** `qwen2.5:7b` requires ~6–8 GB RAM. `qwen2.5:14b` requires ~12 GB RAM.
+⚠️ **Hardware:** `qwen2.5:3b` ~3–4 GB RAM · `qwen2.5:7b` ~6–8 GB RAM · `qwen2.5:14b` ~12 GB RAM.
 
 🔒 **License:** Qwen2.5 is released under Apache 2.0 (commercial use allowed).
 """
@@ -1074,6 +1123,7 @@ ollama pull qwen2.5:14b
     if st.button("Clear session"):
         set_source_text("")
         st.session_state.checker_results = {}
+        st.session_state._translation_cache = {}
         st.session_state.abort_requested = False
         st.session_state._translating = False
         st.session_state._cached_markdown_key = None
@@ -1286,30 +1336,44 @@ if _translate_clicked:
             def _update_counter(n_chars: int) -> None:
                 _token_counter.caption(f"Receiving… {n_chars:,} characters")
 
+            _cache_key = (
+                chunk, selected_model, level, style, region, fidelity,
+                include_literal, include_vocab, include_grammar, temperature,
+            )
             try:
-                result = translate_chunk(
-                    chunk=chunk,
-                    level=level,
-                    style=style,
-                    region=region,
-                    fidelity=fidelity,
-                    include_literal=include_literal,
-                    include_vocab=include_vocab,
-                    include_grammar=include_grammar,
-                    temperature=temperature,
-                    on_token=_update_counter,
-                    model=selected_model,
-                )
-                _token_counter.empty()
-                _elapsed = time.monotonic() - _t_chunk_start
-                _status.update(
-                    label=(
-                        f"Chunk {idx} — {len(result.pairs)} pair(s) "
-                        f"in {_elapsed:.1f}s"
-                    ),
-                    state="complete",
-                    expanded=False,
-                )
+                _cached = st.session_state._translation_cache.get(_cache_key)
+                if _cached is not None:
+                    result = _cached
+                    _status.update(
+                        label=f"Chunk {idx} — {len(result.pairs)} pair(s) (cached)",
+                        state="complete",
+                        expanded=False,
+                    )
+                else:
+                    result = translate_chunk(
+                        chunk=chunk,
+                        level=level,
+                        style=style,
+                        region=region,
+                        fidelity=fidelity,
+                        include_literal=include_literal,
+                        include_vocab=include_vocab,
+                        include_grammar=include_grammar,
+                        temperature=temperature,
+                        on_token=_update_counter,
+                        model=selected_model,
+                    )
+                    _token_counter.empty()
+                    _elapsed = time.monotonic() - _t_chunk_start
+                    _status.update(
+                        label=(
+                            f"Chunk {idx} — {len(result.pairs)} pair(s) "
+                            f"in {_elapsed:.1f}s"
+                        ),
+                        state="complete",
+                        expanded=False,
+                    )
+                    st.session_state._translation_cache[_cache_key] = result
                 st.session_state.results.append(result)
 
             except requests.exceptions.ConnectionError as exc:
@@ -1393,7 +1457,7 @@ if _translate_clicked:
                     _pair.literal_spanish,
                 )
                 _cr = st.session_state.checker_results.get(_ck)
-                if _cr is not None and _cr.severity in ("warning", "fail"):
+                if _cr is not None and _cr.severity == "fail":
                     _pairs_to_retry.append((_pidx, _pair, _ck, _cr))
 
             if _pairs_to_retry:
