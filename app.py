@@ -573,27 +573,47 @@ TEXT:
                     )
                     raise inner_exc
                 raw_pairs = raw.get("pairs", [])
-                cleaned = [p for p in raw_pairs if isinstance(p, dict)]
-                if not cleaned:
+                # Pass 1: drop non-dict elements (e.g. bare strings the model
+                # emits when it confuses schema text with data).
+                dict_pairs = [p for p in raw_pairs if isinstance(p, dict)]
+                # Pass 2: validate each pair individually; drop any that fail.
+                # This catches dicts with wrong value types, e.g. the model
+                # echoing schema metadata ({"english": {"type": "string"}, …})
+                # as a pair — which is a dict but fails Pydantic field checks.
+                valid_pairs: list[dict] = []
+                for idx, p in enumerate(dict_pairs):
+                    try:
+                        ReadingPair.model_validate(p)
+                        valid_pairs.append(p)
+                    except ValidationError as pair_exc:
+                        logger.warning(
+                            "Dropped pairs[%d] — %d field error(s): %s",
+                            idx,
+                            pair_exc.error_count(),
+                            pair_exc.errors(include_url=False),
+                        )
+                if not valid_pairs:
                     logger.error(
                         "TranslationResponse parse failed — no valid pairs after "
-                        "filtering. Raw content (first 300 chars): %s",
+                        "per-pair filtering. Raw content (first 300 chars): %s",
                         content[:300],
                     )
                     raise inner_exc
-                dropped = len(raw_pairs) - len(cleaned)
-                if dropped:
+                total_dropped = len(raw_pairs) - len(valid_pairs)
+                if total_dropped:
                     logger.warning(
-                        "Dropped %d non-object pair(s) from model output "
-                        "(model confused schema example with data).",
-                        dropped,
+                        "Dropped %d pair(s) from model output after validation "
+                        "(non-dict: %d, schema-echo/type-error: %d).",
+                        total_dropped,
+                        len(raw_pairs) - len(dict_pairs),
+                        len(dict_pairs) - len(valid_pairs),
                     )
-                raw["pairs"] = cleaned
+                raw["pairs"] = valid_pairs
                 try:
                     result = TranslationResponse.model_validate(raw)
                 except ValidationError:
                     logger.error(
-                        "TranslationResponse parse failed after pair filtering. "
+                        "TranslationResponse parse failed after per-pair filtering. "
                         "Raw content (first 300 chars): %s",
                         content[:300],
                     )
