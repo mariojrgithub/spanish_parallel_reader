@@ -492,6 +492,13 @@ TEXT:
         t_first_token or 0.0, elapsed, num_predict,
     )
 
+    # Strip markdown code fences that some Ollama versions emit
+    _content_stripped = re.sub(r"^```(?:json)?\s*", "", content.strip(), flags=re.MULTILINE)
+    _content_stripped = re.sub(r"```\s*$", "", _content_stripped.strip(), flags=re.MULTILINE).strip()
+    if _content_stripped != content:
+        logger.debug("Stripped markdown fences from model output before parsing.")
+        content = _content_stripped
+
     try:
         result = TranslationResponse.model_validate_json(content)
     except ValidationError:
