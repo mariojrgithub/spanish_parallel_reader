@@ -255,6 +255,16 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def tts_lang_from_region(region: str) -> str:
+    """Map app translation preference to a Spanish TTS locale."""
+    mapping = {
+        "Neutral": "es-MX",
+        "Latin American": "es-MX",
+        "European / Spain": "es-ES",
+    }
+    return mapping.get(region, "es-MX")
+
+
 def extract_pdf_text(uploaded_file) -> str:
     doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
     pages = []
@@ -808,6 +818,7 @@ def _render_check_badge(result: PairCheckResult) -> None:
 def _render_checker_details(
     result: PairCheckResult,
     detailed: bool,
+    tts_lang: str,
 ) -> None:
     """Render badge + expandable per-issue details for one pair."""
     _render_check_badge(result)
@@ -842,7 +853,7 @@ def _render_checker_details(
         if result.corrected_spanish:
             st.markdown("**Corrected translation:**")
             st.info(result.corrected_spanish)
-            render_tts_button(result.corrected_spanish)
+            render_tts_button(result.corrected_spanish, lang=tts_lang)
 
         if detailed:
             method = "LLM + deterministic" if result.checked_with_llm else "deterministic only"
@@ -936,6 +947,7 @@ ollama pull qwen2.5:14b
         ],
         index=0,
     )
+    tts_lang = tts_lang_from_region(region)
 
     style = st.selectbox(
         "Translation style",
@@ -1500,7 +1512,7 @@ if st.session_state.results:
                     if result.summary_spanish:
                         st.markdown("**Spanish summary**")
                         st.write(result.summary_spanish)
-                        render_tts_button(result.summary_spanish)
+                        render_tts_button(result.summary_spanish, lang=tts_lang)
 
             for pair in result.pairs:
                 with st.container(border=True):
@@ -1526,7 +1538,7 @@ if st.session_state.results:
                             f'{pair.difficulty}</span>',
                             unsafe_allow_html=True,
                         )
-                        render_tts_button(pair.spanish)
+                        render_tts_button(pair.spanish, lang=tts_lang)
 
                     if include_literal and pair.literal_spanish:
                         with st.expander("Literal Spanish"):
@@ -1550,6 +1562,7 @@ if st.session_state.results:
                             _render_checker_details(
                                 _cr,
                                 checker_settings.detailed_diagnostics,
+                                tts_lang,
                             )
 
     with tab_spanish:
@@ -1565,7 +1578,7 @@ if st.session_state.results:
                     f"**Passage {i} / {len(result.pairs)}**",
                 )
                 st.write(pair.spanish)
-                render_tts_button(pair.spanish)
+                render_tts_button(pair.spanish, lang=tts_lang)
 
                 with st.expander("Reveal English"):
                     st.write(pair.english)
