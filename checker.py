@@ -174,6 +174,7 @@ class PairCheckResult(BaseModel):
     language_quality_issues: List[str] = Field(default_factory=list)
     unsupported_claims: List[str] = Field(default_factory=list)
     recommended_action: str = ""
+    corrected_spanish: str = ""
     user_facing_summary: str = ""
     checked_with_llm: bool = False
     deterministic_only: bool = True
@@ -491,6 +492,7 @@ _CHECKER_LLM_SCHEMA = {
         "language_quality_issues": {"type": "array", "items": {"type": "string"}},
         "unsupported_claims": {"type": "array", "items": {"type": "string"}},
         "recommended_action": {"type": "string"},
+        "corrected_spanish": {"type": "string"},
         "user_facing_summary": {"type": "string"},
     },
     "required": ["passed", "score", "severity", "user_facing_summary"],
@@ -531,7 +533,10 @@ def _build_checker_prompt(
         "- Flag: added factual claims, changed numbers, changed names, changed dates, "
         "changed places, altered quotes, unsupported explanations, or meaningful omissions.\n"
         "- Distinguish serious meaning errors from minor stylistic differences.\n"
-        "- Do not rewrite the translation.\n"
+        "- If you identify fixable errors (mistranslations, wrong technical terms, "
+        "altered numbers or names), provide corrected_spanish with the complete "
+        "corrected Spanish translation. If the translation is acceptable or only "
+        "has unfixable issues, set corrected_spanish to an empty string.\n"
         "- Write every JSON string value in English, including user_facing_summary.\n"
         "- score must be a decimal between 0.0 (very poor) and 1.0 (perfect). "
         "Never use the 0–100 percentage scale.\n"
@@ -565,8 +570,8 @@ def ollama_check_pair(
         "keep_alive": _CHECKER_KEEP_ALIVE,
         "options": {
             "temperature": 0.0,
-            # Compact JSON reply — 512 tokens is ample; cap prevents runaway output.
-            "num_predict": 512,
+            # Compact JSON reply; 768 tokens to accommodate optional corrected translation.
+            "num_predict": 768,
             # Checker context: input is ≤ 2×max_chars + prompt ≈ 2 k–3 k tokens.
             # 4096 is sufficient and loads faster than the model's default.
             "num_ctx": 4096,
@@ -605,6 +610,7 @@ def ollama_check_pair(
             language_quality_issues=list(data.get("language_quality_issues", [])),
             unsupported_claims=list(data.get("unsupported_claims", [])),
             recommended_action=str(data.get("recommended_action", "")),
+            corrected_spanish=str(data.get("corrected_spanish", "")),
             user_facing_summary=_ensure_english_summary(str(data.get("user_facing_summary", ""))),
             checked_with_llm=True,
             deterministic_only=False,
@@ -756,8 +762,21 @@ def check_pair(
                 "checker_latency_ms": round((time.monotonic() - t0) * 1000, 1),
             })
         else:
-            # Merge: LLM wins on score/severity, deterministic findings are added
+            # Merge: take the worst severity and lowest score from both results.
+            # Deterministic checks catch objective failures (e.g. identity,
+            # number drift) that the LLM may overlook or excuse.  LLM wins only
+            # when its severity is equal to or worse than the deterministic one.
+            _sev_rank = {"pass": 0, "info": 1, "warning": 2, "fail": 3}
+            _merged_severity = (
+                llm.severity
+                if _sev_rank.get(llm.severity, 0) >= _sev_rank.get(det.severity, 0)
+                else det.severity
+            )
+            _merged_score = min(llm.score, det.score)
             final = llm.model_copy(update={
+                "severity": _merged_severity,
+                "score": _merged_score,
+                "passed": _merged_severity != "fail",
                 "label_issues": _dedup(det.label_issues + llm.label_issues),
                 "hallucination_issues": _dedup(
                     det.hallucination_issues + llm.hallucination_issues
@@ -835,6 +854,9 @@ def checker_markdown_block(
 
         if result.recommended_action:
             lines.append(f">\n> **Recommended action:** {result.recommended_action}")
+
+        if result.corrected_spanish:
+            lines.append(f">\n> **Corrected translation:** {result.corrected_spanish}")
 
         method = "LLM + deterministic" if result.checked_with_llm else "deterministic only"
         lines.append(f">\n> *Checked via {method}*")

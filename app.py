@@ -28,6 +28,7 @@ from checker import (
     get_checker_settings,
     make_check_key,
 )
+from tts_component import render_tts_button
 
 logging.basicConfig(
     level=logging.INFO,
@@ -645,12 +646,15 @@ def retranslate_pair(
     include_grammar: bool,
     temperature: float,
     model: str | None = None,
+    corrected_spanish_hint: str = "",
 ) -> ReadingPair:
     """
     Re-translate a single pair that failed quality checks.
 
     Passes the original English, the rejected Spanish, and the specific issues
     back to the model so it can produce a corrected translation.
+    If corrected_spanish_hint is provided (from the checker), it is included as
+    a reference so the model can use it as a strong basis.
     The original English is always preserved verbatim in the returned pair.
     """
     all_issues = [
@@ -679,6 +683,11 @@ def retranslate_pair(
         "Do not add facts not present in the source."
     )
 
+    _hint_block = (
+        f"\nQUALITY CHECKER SUGGESTED CORRECTION (use as a strong reference):\n{corrected_spanish_hint}\n"
+        if corrected_spanish_hint and corrected_spanish_hint.strip()
+        else ""
+    )
     user = f"""
 A previous Spanish translation of the English sentence below was rejected by a quality checker.
 Produce a corrected translation that fixes every listed issue.
@@ -698,8 +707,7 @@ PREVIOUS SPANISH TRANSLATION (rejected — do NOT copy or reuse it):
 {pair.spanish}
 
 ISSUES FOUND IN PREVIOUS TRANSLATION:
-{issues_text}
-
+{issues_text}{_hint_block}
 Rules:
 - Fix every issue listed above.
 - The "english" field must contain the original English text exactly as shown above.
@@ -748,6 +756,13 @@ Rules:
     )
     resp.raise_for_status()
     content = resp.json().get("message", {}).get("content", "")
+
+    # Strip markdown code fences that some Ollama versions emit (same as translate_chunk).
+    _content_stripped = re.sub(r"^```(?:json)?\s*", "", content.strip(), flags=re.MULTILINE)
+    _content_stripped = re.sub(r"```\s*$", "", _content_stripped.strip(), flags=re.MULTILINE).strip()
+    if _content_stripped != content:
+        logger.debug("Stripped markdown fences from retranslate_pair output before parsing.")
+        content = _content_stripped
 
     try:
         new_pair = ReadingPair.model_validate_json(content)
@@ -823,6 +838,11 @@ def _render_checker_details(
 
         if has_action:
             st.markdown(f"**Recommended action:** {result.recommended_action}")
+
+        if result.corrected_spanish:
+            st.markdown("**Corrected translation:**")
+            st.info(result.corrected_spanish)
+            render_tts_button(result.corrected_spanish)
 
         if detailed:
             method = "LLM + deterministic" if result.checked_with_llm else "deterministic only"
@@ -1337,8 +1357,13 @@ if _translate_clicked:
                         for _pidx, _pair in enumerate(result.pairs)
                     ]
                     for _future in as_completed(_futures):
-                        _ck, _cr = _future.result()
-                        st.session_state.checker_results[_ck] = _cr
+                        try:
+                            _ck, _cr = _future.result()
+                            st.session_state.checker_results[_ck] = _cr
+                        except Exception as _fut_exc:
+                            logger.warning(
+                                "Checker worker raised an exception: %s", _fut_exc
+                            )
                 _chk_status.update(
                     label=f"Checked {len(result.pairs)} pair(s)",
                     state="complete",
@@ -1364,6 +1389,7 @@ if _translate_clicked:
                     f"Correcting {len(_pairs_to_retry)} failed pair(s)…",
                     expanded=True,
                 ) as _retry_status:
+                    _retry_success = 0
                     for _pidx, _pair, _old_ck, _cr in _pairs_to_retry:
                         _retry_status.write(
                             f"Pair {_pidx + 1}: {_cr.user_facing_summary}"
@@ -1381,6 +1407,7 @@ if _translate_clicked:
                                 include_grammar=include_grammar,
                                 temperature=temperature,
                                 model=selected_model,
+                                corrected_spanish_hint=_cr.corrected_spanish,
                             )
                             result.pairs[_pidx] = _new_pair
                             # Remove stale checker result and re-check the corrected pair.
@@ -1394,6 +1421,7 @@ if _translate_clicked:
                                 cached_results={},  # force fresh check
                             )
                             st.session_state.checker_results[_new_ck] = _new_cr
+                            _retry_success += 1
                         except Exception as _retry_exc:
                             logger.warning(
                                 "Retranslation failed for pair %d: %s",
@@ -1403,8 +1431,13 @@ if _translate_clicked:
                             _retry_status.write(
                                 f"  ⚠️ Correction attempt failed: {_retry_exc}"
                             )
+                    _retry_label = (
+                        f"Corrected {_retry_success}/{len(_pairs_to_retry)} pair(s)"
+                        if _retry_success < len(_pairs_to_retry)
+                        else f"Corrected {_retry_success} pair(s)"
+                    )
                     _retry_status.update(
-                        label=f"Corrected {len(_pairs_to_retry)} pair(s)",
+                        label=_retry_label,
                         state="complete",
                     )
 
@@ -1467,6 +1500,7 @@ if st.session_state.results:
                     if result.summary_spanish:
                         st.markdown("**Spanish summary**")
                         st.write(result.summary_spanish)
+                        render_tts_button(result.summary_spanish)
 
             for pair in result.pairs:
                 with st.container(border=True):
@@ -1492,6 +1526,7 @@ if st.session_state.results:
                             f'{pair.difficulty}</span>',
                             unsafe_allow_html=True,
                         )
+                        render_tts_button(pair.spanish)
 
                     if include_literal and pair.literal_spanish:
                         with st.expander("Literal Spanish"):
@@ -1530,6 +1565,7 @@ if st.session_state.results:
                     f"**Passage {i} / {len(result.pairs)}**",
                 )
                 st.write(pair.spanish)
+                render_tts_button(pair.spanish)
 
                 with st.expander("Reveal English"):
                     st.write(pair.english)

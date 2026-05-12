@@ -63,6 +63,9 @@ services:
       CHECKER_DETAILED_DIAGNOSTICS: ${CHECKER_DETAILED_DIAGNOSTICS:-false}
       CHECKER_LLM_ENABLED: ${CHECKER_LLM_ENABLED:-true}
       CHECKER_BATCH_SIZE: ${CHECKER_BATCH_SIZE:-3}
+      ENABLE_TTS: ${ENABLE_TTS:-true}
+      TTS_PROVIDER: ${TTS_PROVIDER:-browser}
+      TTS_LANGUAGE: ${TTS_LANGUAGE:-es}
     deploy:
       resources:
         limits:
