@@ -102,6 +102,36 @@ class TestRenders:
                 tts.render_tts_button("Buenos días", lang="es-MX")
                 assert "es-MX" in _call_html_arg(mock_html)
 
+    def test_non_spanish_lang_falls_back_to_es_mx(self):
+        tts = _get_tts()
+        with patch.object(tts, "ENABLE_TTS", True):
+            with patch("tts_component.components.html") as mock_html:
+                tts.render_tts_button("Buenos días", lang="en-US")
+                assert "es-MX" in _call_html_arg(mock_html)
+
+    def test_default_rate_present_in_output(self):
+        """Speech rate must appear in the JS so the browser slows down to 0.9."""
+        tts = _get_tts()
+        with patch.object(tts, "ENABLE_TTS", True):
+            with patch("tts_component.components.html") as mock_html:
+                tts.render_tts_button("Hola")
+                assert "0.9" in _call_html_arg(mock_html)
+
+    def test_custom_rate_present_in_output(self):
+        tts = _get_tts()
+        with patch.object(tts, "ENABLE_TTS", True):
+            with patch("tts_component.components.html") as mock_html:
+                tts.render_tts_button("Hola", rate=0.75)
+                assert "0.75" in _call_html_arg(mock_html)
+
+    def test_rate_clamped_to_safe_range(self):
+        """Rates outside 0.5–2.0 must be clamped before injection."""
+        tts = _get_tts()
+        with patch.object(tts, "ENABLE_TTS", True):
+            with patch("tts_component.components.html") as mock_html:
+                tts.render_tts_button("Hola", rate=10.0)
+                assert "2.0" in _call_html_arg(mock_html)
+
     def test_height_kwarg_is_38(self):
         tts = _get_tts()
         with patch.object(tts, "ENABLE_TTS", True):
@@ -146,12 +176,37 @@ class TestRenders:
 # ---------------------------------------------------------------------------
 
 class TestConstants:
-    def test_tts_language_default_is_es(self, monkeypatch):
-        """TTS_LANGUAGE must default to 'es' when env var is absent."""
+    def test_tts_language_default_is_es_mx(self, monkeypatch):
+        """TTS_LANGUAGE must default to 'es-MX' when env var is absent."""
         monkeypatch.delenv("TTS_LANGUAGE", raising=False)
         import tts_component as tts
         importlib.reload(tts)
-        assert tts.TTS_LANGUAGE == "es"
+        assert tts.TTS_LANGUAGE == "es-MX"
+
+    def test_tts_rate_default_is_0_9(self, monkeypatch):
+        """TTS_RATE must default to 0.9 when env var is absent."""
+        monkeypatch.delenv("TTS_RATE", raising=False)
+        import tts_component as tts
+        importlib.reload(tts)
+        assert tts.TTS_RATE == 0.9
+
+    def test_tts_rate_clamped_high(self, monkeypatch):
+        monkeypatch.setenv("TTS_RATE", "99")
+        import tts_component as tts
+        importlib.reload(tts)
+        assert tts.TTS_RATE == 2.0
+
+    def test_tts_rate_clamped_low(self, monkeypatch):
+        monkeypatch.setenv("TTS_RATE", "0.1")
+        import tts_component as tts
+        importlib.reload(tts)
+        assert tts.TTS_RATE == 0.5
+
+    def test_tts_rate_invalid_falls_back(self, monkeypatch):
+        monkeypatch.setenv("TTS_RATE", "fast")
+        import tts_component as tts
+        importlib.reload(tts)
+        assert tts.TTS_RATE == 0.9
 
     def test_enable_tts_default_is_true(self, monkeypatch):
         monkeypatch.delenv("ENABLE_TTS", raising=False)
