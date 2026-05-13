@@ -17,7 +17,9 @@ RUN pip install -r requirements.txt
 
 COPY app.py .
 COPY checker.py .
+COPY text_processing.py .
 COPY tts_component.py .
+COPY infrastructure ./infrastructure
 COPY .streamlit .streamlit
 
 EXPOSE 8501

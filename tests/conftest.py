@@ -54,7 +54,7 @@ def _stub_streamlit() -> None:
         "subheader", "header", "success", "error", "warning", "info",
         "stop", "rerun", "divider", "empty", "spinner", "status",
         "text_area", "text_input", "selectbox", "slider", "checkbox",
-        "radio", "number_input", "file_uploader", "button",
+        "radio", "number_input", "file_uploader", "button", "progress",
         "dataframe", "download_button", "metric", "code", "image",
         "container", "expander",
     ]:
@@ -161,6 +161,8 @@ def checker_settings_factory():
         model: str = "qwen2.5:7b",
         max_chars: int = 2500,
         batch_size: int = 1,
+        det_workers: int = 4,
+        llm_concurrency: int = 1,
     ) -> CheckerSettings:
         return CheckerSettings(
             enabled=True,
@@ -174,6 +176,8 @@ def checker_settings_factory():
             detailed_diagnostics=False,
             llm_enabled=llm_enabled,
             batch_size=batch_size,
+            det_workers=det_workers,
+            llm_concurrency=llm_concurrency,
             ollama_host="http://localhost:11434",
         )
     return _make

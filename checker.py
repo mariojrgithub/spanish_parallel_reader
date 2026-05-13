@@ -33,9 +33,9 @@ logger = logging.getLogger(__name__)
 
 import requests
 from pydantic import BaseModel, Field
+from infrastructure.ollama_client import chat as _ollama_chat
 
-# Persistent HTTP session — reuses TCP connections across all checker calls.
-_http_session = requests.Session()
+# Persistent HTTP session lives in infrastructure.ollama_client.
 
 # keep_alive sent with every Ollama request — must be a JSON number, never a string.
 _keep_alive_raw = os.getenv("OLLAMA_KEEP_ALIVE", "-1")
@@ -84,6 +84,8 @@ class CheckerSettings:
     detailed_diagnostics: bool
     llm_enabled: bool
     batch_size: int
+    det_workers: int
+    llm_concurrency: int
     ollama_host: str
 
 
@@ -151,6 +153,8 @@ def get_checker_settings(
             else _bool("CHECKER_LLM_ENABLED", True)
         ),
         batch_size=int(os.getenv("CHECKER_BATCH_SIZE", "3")),
+        det_workers=int(os.getenv("CHECKER_DETERMINISTIC_WORKERS", "4")),
+        llm_concurrency=int(os.getenv("CHECKER_LLM_CONCURRENCY", "1")),
         ollama_host=(
             ollama_host or os.getenv("OLLAMA_HOST", "http://ollama:11434")
         ).rstrip("/"),
@@ -475,6 +479,28 @@ def should_run_llm_checker(
     return rng.random() < settings.sample_rate
 
 
+
+def should_retry_translation(
+    settings: CheckerSettings,
+    check_result: PairCheckResult,
+) -> bool:
+    """Return True when checker output should trigger a correction/retranslation."""
+    if not settings.enabled or settings.mode == "off":
+        return False
+
+    # Fast mode has no normal LLM checker correction, but it should still retry
+    # obvious deterministic failures such as identical English/Spanish output.
+    if settings.mode == "fast":
+        return check_result.severity == "fail" or not check_result.passed
+
+    return (
+        check_result.severity == "fail"
+        or not check_result.passed
+        or bool(check_result.corrected_spanish.strip())
+    )
+
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Layer 3: LLM checker
 # ──────────────────────────────────────────────────────────────────────────────
@@ -582,15 +608,11 @@ def ollama_check_pair(
 
     try:
         t0 = time.monotonic()
-        resp = _http_session.post(
-            f"{settings.ollama_host}/api/chat",
-            json=payload,
-            timeout=settings.timeout_seconds,
+        content = _ollama_chat(
+            settings.ollama_host, payload, settings.timeout_seconds
         )
-        resp.raise_for_status()
         latency_ms = round((time.monotonic() - t0) * 1000, 1)
 
-        content = resp.json().get("message", {}).get("content", "")
         data = _parse_checker_json(content)
         if data is None:
             return _checker_unavailable("LLM checker returned non-JSON output.")

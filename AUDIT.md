@@ -265,3 +265,33 @@ MAX_CHARS_PER_CHUNK=2200
 ```
 
 Switch to `CHECKER_MODE=smart` if translation quality validation is more important than speed.
+
+---
+
+## 11. Post-Audit Improvement Plan (Chunks 1–15)
+
+A second pass of improvements was applied after the initial audit to improve structure, perceived performance, and UX. All changes kept local-first behaviour and preserved the 147-test baseline throughout.
+
+| Chunk | Change | Files |
+|-------|--------|-------|
+| 1 | Fixed 3 stale test failures; baseline raised 129 → 147 passing | `tests/` |
+| 2 | `_hard_wrap` word-boundary splitter + hard-limit guarantee in `split_into_chunks` | `app.py` |
+| 3 | `_BoundedCache` LRU session cache for translation results | `app.py` |
+| 4 | `render_result_card` helper + progressive per-chunk rendering | `app.py` |
+| 5 | Sidebar `instant` render mode; loop restructured to render before check in non-strict mode | `app.py` |
+| 6 | `CHECKER_DETERMINISTIC_WORKERS` / `CHECKER_LLM_CONCURRENCY` env vars in `CheckerSettings` | `checker.py`, `.env`, `.env.example`, compose files |
+| 7 | `TRANSLATION_INCLUDE_ENRICHMENTS` env var + "⚡ Skip enrichments" sidebar checkbox | `app.py`, `.env`, `.env.example`, compose files |
+| 8 | Per-chunk "⚡ Add vocab, grammar & literal Spanish" button in Study tab (lazy enrichment) | `app.py` |
+| 9 | `parse_warnings` field on `TranslationResponse`; omission/drop warnings surfaced in UI | `app.py`, `tests/test_schemas.py` |
+| 10 | `infrastructure/ollama_client.py` — shared `requests.Session` + `chat`/`stream_chat` helpers extracted from `app.py` and `checker.py`; test patches updated | `infrastructure/`, `app.py`, `checker.py`, `tests/` |
+| 11 | `load_model()` using `/api/generate` empty-prompt warmup; `warmup_model()` simplified | `infrastructure/ollama_client.py`, `app.py` |
+| 12 | `text_processing.py` — pure text-processing functions extracted from `app.py`; `fitz`/`docx` imports removed from `app.py` | `text_processing.py`, `app.py`, `tests/test_text_processing.py` |
+| 13 | All three compose files updated with missing env vars; `.env.example` completed with `ENABLE_TTS` / `TTS_PROVIDER` | `docker-compose*.yml`, `.env.example` |
+| 14 | Stop button removed (was always disabled); `st.progress()` bar added to translation loop | `app.py`, `tests/conftest.py` |
+| 15 | Final validation: 147 tests, all syntax clean, all compose files valid; `.env` synced with `.env.example` | `.env` |
+
+### Final test result
+
+```
+147 passed in 2.90s
+```
