@@ -79,6 +79,11 @@ OLLAMA_REQUEST_TIMEOUT = int(os.getenv("OLLAMA_REQUEST_TIMEOUT", "240"))
 DEFAULT_MAX_CHARS = int(os.getenv("MAX_CHARS_PER_CHUNK", "2200"))
 TRANSLATION_CACHE_MAX_ENTRIES = int(os.getenv("TRANSLATION_CACHE_MAX_ENTRIES", "50"))
 
+# qwen2.5:3b can drift or truncate on large structured JSON responses.
+# Guardrails keep requests within a safer operating envelope.
+QWEN25_3B_SAFE_MAX_CHARS = 1200
+QWEN25_3B_SAFE_NUM_PREDICT_CAP = 3200
+
 # Persistent HTTP session lives in infrastructure.ollama_client (imported above).
 
 # Pre-compiled regex patterns — aliases from text_processing.
@@ -501,6 +506,11 @@ def split_into_chunks(text: str, max_chars: int) -> List[str]:
     return _split_into_chunks_impl(text, max_chars)
 
 
+def _is_qwen25_3b_model(model_name: str) -> bool:
+    """Return True when the selected model is qwen2.5:3b (any tag variant)."""
+    return model_name.strip().lower().startswith("qwen2.5:3b")
+
+
 # -----------------------------
 # Ollama helpers
 # -----------------------------
@@ -624,11 +634,14 @@ TEXT:
 {chunk}
 """
 
-    num_predict = _estimate_num_predict(
-        len(chunk), include_literal, include_vocab, include_grammar
-    )
-
     _model = model or OLLAMA_MODEL
+    num_predict = _estimate_num_predict(
+        len(chunk),
+        include_literal,
+        include_vocab,
+        include_grammar,
+        model_name=_model,
+    )
     payload = {
         "model": _model,
         "messages": [
@@ -794,6 +807,7 @@ def _estimate_num_predict(
     include_literal: bool,
     include_vocab: bool,
     include_grammar: bool,
+    model_name: str = "",
 ) -> int:
     """Adaptive num_predict budget based on chunk size and enabled features."""
     base = min(chunk_len * 3, 4000)
@@ -803,11 +817,13 @@ def _estimate_num_predict(
         base += 800
     if include_grammar:
         base += 600
+    cap = 5000
+    if _is_qwen25_3b_model(model_name):
+        cap = QWEN25_3B_SAFE_NUM_PREDICT_CAP
     # Hard cap: smaller models (3b) cannot reliably generate very long JSON and
     # will ramble to the token limit if given too much budget, producing ~3× the
-    # input length as unparseable output.  5000 tokens (~15 k chars) is
-    # sufficient for any realistic chunk and keeps 3b output bounded.
-    return min(max(base, 800), 5000)
+    # input length as unparseable output.
+    return min(max(base, 800), cap)
 
 
 def _dynamic_num_ctx(chunk_len: int, num_predict: int) -> int:
@@ -964,7 +980,11 @@ Rules:
 
     _model = model or OLLAMA_MODEL
     num_predict = _estimate_num_predict(
-        len(pair.english), include_literal, include_vocab, include_grammar
+        len(pair.english),
+        include_literal,
+        include_vocab,
+        include_grammar,
+        model_name=_model,
     )
 
     payload = {
@@ -1678,15 +1698,29 @@ with st.sidebar:
     )
 
     if _advanced_mode:
+        _chunk_upper_bound = (
+            QWEN25_3B_SAFE_MAX_CHARS
+            if _is_qwen25_3b_model(selected_model)
+            else 4000
+        )
         max_chars = st.slider(
             "Max characters per chunk",
             800,
-            4000,
-            DEFAULT_MAX_CHARS,
+            _chunk_upper_bound,
+            min(DEFAULT_MAX_CHARS, _chunk_upper_bound),
             step=100,
         )
     else:
         max_chars = DEFAULT_MAX_CHARS
+
+    if _is_qwen25_3b_model(selected_model):
+        if max_chars > QWEN25_3B_SAFE_MAX_CHARS:
+            max_chars = QWEN25_3B_SAFE_MAX_CHARS
+        st.info(
+            "qwen2.5:3b guardrail active: "
+            f"max chunk size {QWEN25_3B_SAFE_MAX_CHARS} chars and "
+            f"max output budget {QWEN25_3B_SAFE_NUM_PREDICT_CAP} tokens."
+        )
 
     chunks_to_process = st.slider(
         "Chunks to process",
@@ -1743,6 +1777,12 @@ with st.sidebar:
     )
     if _skip_enrichments:
         include_grammar = False
+
+    if _is_qwen25_3b_model(selected_model) and not _skip_enrichments:
+        st.warning(
+            "qwen2.5:3b with enrichments can produce long JSON and parse failures. "
+            "For best reliability, enable 'Skip enrichments (faster)' or keep chunks small."
+        )
 
     with st.expander("🔍 Output Checker"):
         # Derive sidebar defaults from env vars so Docker/local overrides take effect

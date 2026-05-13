@@ -188,6 +188,15 @@ class TestEstimateNumPredict:
         # chunk_len=100: base_raw=300; +600 grammar = 900; above floor
         assert _estimate_num_predict(100, False, False, True) == 900
 
+    def test_qwen25_3b_has_lower_cap(self):
+        # chunk_len=10000 with enrichments would hit 6000, but 3b guardrail caps at 3200
+        result = _estimate_num_predict(10_000, True, True, True, model_name="qwen2.5:3b")
+        assert result == 3200
+
+    def test_non_3b_cap_remains_5000(self):
+        result = _estimate_num_predict(10_000, True, True, True, model_name="qwen2.5:7b")
+        assert result == 5000
+
 
 # ---------------------------------------------------------------------------
 # _fix_english_summary
