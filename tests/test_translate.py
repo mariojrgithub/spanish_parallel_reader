@@ -79,7 +79,7 @@ _DEFAULT_KWARGS = dict(
 class TestTranslateChunkSuccess:
     def test_returns_translation_response(self, monkeypatch):
         mock_resp = _fake_streaming_response(_make_valid_json_response())
-        with patch("app._http_session") as mock_session:
+        with patch("infrastructure.ollama_client.session") as mock_session:
             mock_session.post.return_value = mock_resp
             result = translate_chunk(chunk="Hello world.", **_DEFAULT_KWARGS)
         assert isinstance(result, TranslationResponse)
@@ -88,7 +88,7 @@ class TestTranslateChunkSuccess:
 
     def test_summary_english_unchanged_when_english(self, monkeypatch):
         mock_resp = _fake_streaming_response(_make_valid_json_response())
-        with patch("app._http_session") as mock_session:
+        with patch("infrastructure.ollama_client.session") as mock_session:
             mock_session.post.return_value = mock_resp
             result = translate_chunk(chunk="Hello world.", **_DEFAULT_KWARGS)
         assert result.summary_english == "A short English summary."
@@ -96,7 +96,7 @@ class TestTranslateChunkSuccess:
     def test_selected_model_sent_in_payload(self):
         """The model kwarg must be forwarded to the Ollama /api/chat payload."""
         mock_resp = _fake_streaming_response(_make_valid_json_response())
-        with patch("app._http_session") as mock_session:
+        with patch("infrastructure.ollama_client.session") as mock_session:
             mock_session.post.return_value = mock_resp
             translate_chunk(chunk="Hello.", model="qwen2.5:14b", **_DEFAULT_KWARGS)
         call_kwargs = mock_session.post.call_args
@@ -128,7 +128,7 @@ class TestTranslateChunkSuccess:
 
 class TestTranslateChunkConnectionError:
     def test_raises_connection_error(self):
-        with patch("app._http_session") as mock_session:
+        with patch("infrastructure.ollama_client.session") as mock_session:
             mock_session.post.side_effect = requests.exceptions.ConnectionError("refused")
             with pytest.raises(requests.exceptions.ConnectionError, match="Cannot reach Ollama"):
                 translate_chunk(chunk="Hello.", **_DEFAULT_KWARGS)
@@ -140,7 +140,7 @@ class TestTranslateChunkConnectionError:
 
 class TestTranslateChunkTimeout:
     def test_raises_timeout(self):
-        with patch("app._http_session") as mock_session:
+        with patch("infrastructure.ollama_client.session") as mock_session:
             mock_session.post.side_effect = requests.exceptions.Timeout("timed out")
             with pytest.raises(requests.exceptions.Timeout, match="did not respond"):
                 translate_chunk(chunk="Hello.", **_DEFAULT_KWARGS)
@@ -159,7 +159,7 @@ class TestTranslateChunkHTTPError:
         mock_resp.json.return_value = {"error": "model not found"}
         mock_resp.__enter__ = lambda self: self
         mock_resp.__exit__ = MagicMock(return_value=False)
-        with patch("app._http_session") as mock_session:
+        with patch("infrastructure.ollama_client.session") as mock_session:
             mock_session.post.return_value = mock_resp
             with pytest.raises(requests.exceptions.HTTPError, match="Ollama said"):
                 translate_chunk(chunk="Hello.", **_DEFAULT_KWARGS)
@@ -176,9 +176,9 @@ class TestEstimateNumPredict:
         assert result == 800  # minimum floor (max(30, 800))
 
     def test_maximum_budget(self):
-        # chunk_len=10000: base_raw=4000+600+800+600=6000; ceiling=8000 → 6000
+        # chunk_len=10000: base=min(30000,4000)+600+800+600=6000; hard cap=5000
         result = _estimate_num_predict(10_000, True, True, True)
-        assert result == 6000
+        assert result == 5000
 
     def test_vocab_adds_800(self):
         # chunk_len=100: base_raw=300; +800 vocab = 1100; above floor

@@ -16,9 +16,15 @@ def test_env_example_has_qwen25_7b():
 
 def test_env_example_has_available_models():
     content = (ROOT / ".env.example").read_text(encoding="utf-8")
-    assert "AVAILABLE_OLLAMA_MODELS=qwen2.5:7b,qwen2.5:14b" in content, (
-        ".env.example must define AVAILABLE_OLLAMA_MODELS with both Qwen2.5 variants"
-    )
+    # Find the AVAILABLE_OLLAMA_MODELS line (may include extra models like 3b)
+    for line in content.splitlines():
+        if line.startswith("AVAILABLE_OLLAMA_MODELS="):
+            value = line.split("=", 1)[1]
+            models = [m.strip() for m in value.split(",")]
+            assert models[0] == "qwen2.5:7b", ".env.example: qwen2.5:7b must be first"
+            assert "qwen2.5:14b" in models, ".env.example: qwen2.5:14b must be listed"
+            return
+    raise AssertionError(".env.example must define AVAILABLE_OLLAMA_MODELS")
 
 
 def test_env_example_14b_is_not_default():

@@ -7,13 +7,22 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Literal
 
-import fitz
-
 import pandas as pd
 import requests
 import streamlit as st
-from docx import Document
 from pydantic import BaseModel, Field, ValidationError, field_validator
+from text_processing import (
+    RE_PAGE_NUM as _RE_PAGE_NUM,
+    RE_HSPACE as _RE_HSPACE,
+    RE_NEWLINES as _RE_NEWLINES,
+    RE_SENTENCES as _RE_SENTENCES,
+    clean_text,
+    extract_pdf_text,
+    extract_docx_text,
+    extract_plain_text,
+    _hard_wrap,
+    split_into_chunks as _split_into_chunks_impl,
+)
 
 # Optional: load .env file when running locally (no-op inside Docker)
 try:
@@ -28,6 +37,13 @@ from checker import (
     checker_markdown_block,
     get_checker_settings,
     make_check_key,
+    should_retry_translation,
+)
+from infrastructure.ollama_client import (
+    chat as _ollama_chat,
+    load_model as _ollama_load,
+    session as _http_session,
+    stream_chat as _ollama_stream,
 )
 from tts_component import render_tts_button
 
@@ -61,17 +77,54 @@ OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.1"))
 OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "0.9"))
 OLLAMA_REQUEST_TIMEOUT = int(os.getenv("OLLAMA_REQUEST_TIMEOUT", "240"))
 DEFAULT_MAX_CHARS = int(os.getenv("MAX_CHARS_PER_CHUNK", "2200"))
+TRANSLATION_CACHE_MAX_ENTRIES = int(os.getenv("TRANSLATION_CACHE_MAX_ENTRIES", "50"))
 
-# Persistent HTTP session — reuses TCP connections across all Ollama calls.
-_http_session = requests.Session()
+# Persistent HTTP session lives in infrastructure.ollama_client (imported above).
 
-# Pre-compiled regex patterns — avoids recompilation on every text operation.
-_RE_PAGE_NUM = re.compile(r"\n\s*\d+\s*\n")
-_RE_HSPACE = re.compile(r"[ \t]+")
-_RE_NEWLINES = re.compile(r"\n{3,}")
-_RE_SENTENCES = re.compile(r"(?<=[.!?])\s+")
+# Pre-compiled regex patterns — aliases from text_processing.
 
 Difficulty = Literal["A1", "A2", "B1", "B2", "C1", "C2"]
+
+
+# -----------------------------
+# Bounded LRU session cache
+# -----------------------------
+
+from collections import OrderedDict
+
+
+class _BoundedCache:
+    """LRU-style dict capped at *max_entries*.
+
+    Oldest entry is evicted when the cap is reached.  Accessing an entry
+    moves it to most-recently-used position.  All data stays in
+    st.session_state — no global/cross-user state.
+    """
+
+    def __init__(self, max_entries: int) -> None:
+        self._max = max(1, max_entries)
+        self._data: OrderedDict = OrderedDict()
+
+    def get(self, key: object) -> object:
+        """Return value or None; promotes key to MRU position."""
+        if key not in self._data:
+            return None
+        self._data.move_to_end(key)
+        return self._data[key]
+
+    def put(self, key: object, value: object) -> None:
+        """Insert/update key; evicts LRU entry when over capacity."""
+        if key in self._data:
+            self._data.move_to_end(key)
+        self._data[key] = value
+        while len(self._data) > self._max:
+            self._data.popitem(last=False)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+    def __len__(self) -> int:
+        return len(self._data)
 
 
 def _inline_schema(schema: dict) -> dict:
@@ -115,6 +168,9 @@ class ReadingPair(BaseModel):
     grammar_notes: List[str] = Field(default_factory=list)
     comprehension_question_spanish: str = ""
     difficulty: Difficulty = "B1"
+    # Runtime-only flags used by the UI to mark checker-applied fixes.
+    corrected_by_checker: bool = Field(default=False, exclude=True)
+    correction_note: str = Field(default="", exclude=True)
 
     @field_validator("difficulty", mode="before")
     @classmethod
@@ -142,6 +198,9 @@ class TranslationResponse(BaseModel):
     summary_english: str = Field(default="", description="A brief summary of the text written in ENGLISH only. Never use Spanish here.")
     summary_spanish: str = Field(default="", description="Un breve resumen del texto escrito únicamente en ESPAÑOL. Never use English here.")
     pairs: List[ReadingPair]
+    # Runtime-only: populated by translate_chunk when pairs are dropped or fields
+    # are empty. Not part of the LLM schema; excluded from all serialisation.
+    parse_warnings: List[str] = Field(default_factory=list, exclude=True)
 
 
 # Module-level schema constant — computed once at startup.
@@ -249,20 +308,19 @@ if "checker_results" not in st.session_state:
     # Maps cache_key -> PairCheckResult. Populated after each translation event.
     st.session_state.checker_results = {}
 
-if "abort_requested" not in st.session_state:
-    st.session_state.abort_requested = False
-
-if "_translating" not in st.session_state:
-    st.session_state._translating = False
-
 if "_cached_markdown_key" not in st.session_state:
     st.session_state._cached_markdown_key = None
     st.session_state._cached_markdown = None
 
 if "_translation_cache" not in st.session_state:
-    # Maps (chunk, model, level, style, region, fidelity, flags, temp) → TranslationResponse.
-    # Prevents re-running inference for identical inputs within a session.
-    st.session_state._translation_cache = {}
+    # LRU-bounded cache: (chunk, model, level, style, region, fidelity, flags, temp) → TranslationResponse.
+    # Capped at TRANSLATION_CACHE_MAX_ENTRIES to bound session memory.
+    st.session_state._translation_cache = _BoundedCache(TRANSLATION_CACHE_MAX_ENTRIES)
+
+if "_enrich_idx" not in st.session_state:
+    # Index into st.session_state.results of a chunk pending on-demand enrichment.
+    # Set by the "⚡ Add enrichments" button; cleared after enrichment completes.
+    st.session_state._enrich_idx = None
 
 
 # -----------------------------
@@ -275,15 +333,7 @@ def set_source_text(text: str) -> None:
     if cleaned != st.session_state.raw_text:
         st.session_state.raw_text = cleaned
         st.session_state.results = []
-        st.session_state._translation_cache = {}
-
-def clean_text(text: str) -> str:
-    text = text.replace("\r", "\n")
-    text = _RE_PAGE_NUM.sub("\n", text)
-    text = _RE_HSPACE.sub(" ", text)
-    text = _RE_NEWLINES.sub("\n\n", text)
-    return text.strip()
-
+        st.session_state._translation_cache.clear()
 
 def tts_lang_from_region(region: str) -> str:
     """Map app translation preference to a Spanish TTS locale."""
@@ -295,63 +345,17 @@ def tts_lang_from_region(region: str) -> str:
     return mapping.get(region, "es-MX")
 
 
-def extract_pdf_text(uploaded_file) -> str:
-    doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-    pages = []
-
-    for page in doc:
-        pages.append(page.get_text("text", sort=True))
-
-    return clean_text("\n\n".join(pages))
+def _elapsed_suffix(start_time: float) -> str:
+    return f" in {time.monotonic() - start_time:.1f}s"
 
 
-def extract_docx_text(uploaded_file) -> str:
-    doc = Document(uploaded_file)
-    paragraphs = [
-        paragraph.text.strip()
-        for paragraph in doc.paragraphs
-        if paragraph.text.strip()
-    ]
-    return clean_text("\n\n".join(paragraphs))
-
-
-def extract_plain_text(uploaded_file) -> str:
-    return clean_text(
-        uploaded_file.read().decode("utf-8", errors="ignore")
-    )
+def _overall_progress(chunk_position: int, chunk_count: int, phase_fraction: float) -> float:
+    return min(((chunk_position - 1) + phase_fraction) / max(chunk_count, 1), 1.0)
 
 
 @st.cache_data
 def split_into_chunks(text: str, max_chars: int) -> List[str]:
-    paragraphs = [
-        paragraph.strip()
-        for paragraph in text.split("\n\n")
-        if paragraph.strip()
-    ]
-
-    chunks = []
-    current = ""
-
-    for paragraph in paragraphs:
-        if len(paragraph) > max_chars:
-            parts = _RE_SENTENCES.split(paragraph)
-        else:
-            parts = [paragraph]
-
-        for part in parts:
-            if len(current) + len(part) + 2 <= max_chars:
-                current = (
-                    current + "\n\n" + part
-                ).strip() if current else part
-            else:
-                if current:
-                    chunks.append(current)
-                current = part
-
-    if current:
-        chunks.append(current)
-
-    return chunks
+    return _split_into_chunks_impl(text, max_chars)
 
 
 # -----------------------------
@@ -390,27 +394,19 @@ def check_ollama(model: str = OLLAMA_MODEL):
 
 @st.cache_resource
 def warmup_model(model: str) -> None:
-    """Pre-load the model into Ollama memory with a 1-token request.
+    """Pin the model into Ollama GPU memory without generating any tokens.
 
-    @st.cache_resource ensures this runs at most once per model per app
-    restart.  Executes in a daemon thread so it never blocks the UI.
+    Uses POST /api/generate with an empty prompt — loads weights immediately
+    without wasting time on token generation.  @st.cache_resource ensures
+    this runs at most once per model per app restart.  Executes in a daemon
+    thread so it never blocks the UI.
     """
     import threading
 
     def _ping() -> None:
         try:
-            _http_session.post(
-                f"{OLLAMA_HOST}/api/chat",
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "stream": False,
-                    "keep_alive": OLLAMA_KEEP_ALIVE,
-                    "options": {"num_predict": 1},
-                },
-                timeout=30,
-            )
-            logger.info("warmup_model: %s pre-loaded", model)
+            _ollama_load(OLLAMA_HOST, model, keep_alive=OLLAMA_KEEP_ALIVE, timeout=30.0)
+            logger.info("warmup_model: %s pinned in memory", model)
         except Exception as exc:
             logger.debug("warmup_model: skipped (%s)", exc)
 
@@ -512,42 +508,10 @@ TEXT:
     }
 
     t0 = time.monotonic()
-    content = ""
-    t_first_token: float | None = None
-    _last_on_token_len = 0
-
     try:
-        with _http_session.post(
-            f"{OLLAMA_HOST}/api/chat",
-            json=payload,
-            timeout=OLLAMA_REQUEST_TIMEOUT,
-            stream=True,
-        ) as response:
-            if not response.ok:
-                try:
-                    detail = response.json().get("error", response.text)
-                except Exception:
-                    detail = response.text
-                raise requests.exceptions.HTTPError(
-                    f"{response.status_code} {response.reason} — Ollama said: {detail}",
-                    response=response,
-                )
-            for raw_line in response.iter_lines():
-                if not raw_line:
-                    continue
-                try:
-                    chunk_data = json.loads(raw_line)
-                except json.JSONDecodeError:
-                    continue
-                token = chunk_data.get("message", {}).get("content", "")
-                if token and t_first_token is None:
-                    t_first_token = time.monotonic() - t0
-                content += token
-                if on_token is not None and len(content) - _last_on_token_len >= 150:
-                    on_token(len(content))
-                    _last_on_token_len = len(content)
-                if chunk_data.get("done"):
-                    break
+        content, t_first_token = _ollama_stream(
+            OLLAMA_HOST, payload, OLLAMA_REQUEST_TIMEOUT, on_token
+        )
     except requests.exceptions.ConnectionError as exc:
         raise requests.exceptions.ConnectionError(
             f"Cannot reach Ollama at {OLLAMA_HOST}. "
@@ -642,6 +606,11 @@ TEXT:
                         content[:300],
                     )
                     raise inner_exc
+                if total_dropped:
+                    result.parse_warnings.append(
+                        f"{total_dropped} pair(s) were dropped during parsing "
+                        "(malformed model output \u2014 see logs for details)."
+                    )
         else:
             logger.error(
                 "TranslationResponse parse failed — no JSON object found. "
@@ -652,6 +621,17 @@ TEXT:
 
     # Post-process: fix summary_english if the model wrote it in Spanish.
     result.summary_english = _fix_english_summary(result.summary_english, chunk)
+
+    # Post-parse omission check: flag pairs with empty source or translation.
+    for _pidx, _pair in enumerate(result.pairs):
+        if not _pair.english.strip():
+            result.parse_warnings.append(
+                f"Pair {_pidx + 1}: English field is empty \u2014 source text may have been dropped."
+            )
+        if not _pair.spanish.strip():
+            result.parse_warnings.append(
+                f"Pair {_pidx + 1}: Spanish field is empty \u2014 translation is missing."
+            )
 
     # Post-process: strip any trailing ellipsis the model added as abbreviation.
     result.summary_english = _strip_ellipsis(result.summary_english)
@@ -712,6 +692,11 @@ def _strip_ellipsis(text: str) -> str:
                 s = s[: -len(marker)].rstrip()
                 changed = True
     return s
+
+
+def _norm_text_for_compare(text: str) -> str:
+    """Normalise whitespace/case to compare whether two strings meaningfully differ."""
+    return " ".join((text or "").split()).strip().casefold()
 
 
 def _fix_english_summary(summary: str, source_chunk: str) -> str:
@@ -856,13 +841,8 @@ Rules:
         },
     }
 
-    resp = _http_session.post(
-        f"{OLLAMA_HOST}/api/chat",
-        json=payload,
-        timeout=OLLAMA_REQUEST_TIMEOUT,
-    )
-    resp.raise_for_status()
-    content = resp.json().get("message", {}).get("content", "")
+    resp = _ollama_chat(OLLAMA_HOST, payload, OLLAMA_REQUEST_TIMEOUT)
+    content = resp
 
     # Strip markdown code fences that some Ollama versions emit (same as translate_chunk).
     _content_stripped = re.sub(r"^```(?:json)?\s*", "", content.strip(), flags=re.MULTILINE)
@@ -967,6 +947,118 @@ def _render_checker_details(
             )
 
 
+def render_result_card(
+    result: "TranslationResponse",
+    *,
+    checker_results: dict,
+    checker_settings: "CheckerSettings",
+    include_literal: bool,
+    tts_lang: str,
+    result_idx: "int | None" = None,
+) -> None:
+    """Render one TranslationResponse as a parallel-reader card.
+
+    Called both during progressive rendering (inside the translate loop) and
+    inside the Study > Parallel Reader tab.
+    """
+    if result.title:
+        st.markdown(f"### {result.title}")
+
+    for _warn in result.parse_warnings:
+        st.warning(_warn)
+
+    if result.summary_english or result.summary_spanish:
+        with st.expander("Summary"):
+            if result.summary_english:
+                st.markdown("**English summary**")
+                st.write(result.summary_english)
+            if result.summary_spanish:
+                st.markdown("**Spanish summary**")
+                st.write(result.summary_spanish)
+                render_tts_button(result.summary_spanish, lang=tts_lang)
+
+    for pair in result.pairs:
+        with st.container(border=True):
+            left, right = st.columns(2)
+
+            with left:
+                st.markdown("**English**")
+                st.markdown(
+                    f'<p class="passage-text">{_html.escape(pair.english).replace(chr(10), "<br>")}</p>',
+                    unsafe_allow_html=True,
+                )
+
+            with right:
+                st.markdown("**Español**")
+                st.markdown(
+                    f'<p class="passage-text">{_html.escape(pair.spanish).replace(chr(10), "<br>")}</p>',
+                    unsafe_allow_html=True,
+                )
+                if pair.corrected_by_checker:
+                    _note = pair.correction_note or "Updated after checker correction"
+                    st.markdown(
+                        f'<span style="background:#dcfce7;color:#166534;'
+                        f'padding:2px 8px;border-radius:4px;'
+                        f'font-size:0.80rem;font-weight:700;margin-right:6px;">'
+                        f'Corrected</span>'
+                        f'<span class="small-muted">{_html.escape(_note)}</span>',
+                        unsafe_allow_html=True,
+                    )
+                st.markdown(
+                    f'<span style="background:#e0f2fe;color:#0369a1;'
+                    f'padding:2px 8px;border-radius:4px;'
+                    f'font-size:0.82rem;font-weight:600;">'
+                    f'{pair.difficulty}</span>',
+                    unsafe_allow_html=True,
+                )
+                render_tts_button(pair.spanish, lang=tts_lang)
+
+            if include_literal and pair.literal_spanish:
+                with st.expander("Literal Spanish"):
+                    st.write(pair.literal_spanish)
+
+            if pair.grammar_notes:
+                with st.expander("Grammar notes"):
+                    st.markdown(
+                        "\n".join(f"- {note}" for note in pair.grammar_notes)
+                    )
+
+            if pair.comprehension_question_spanish:
+                with st.expander("Comprehension question"):
+                    st.write(pair.comprehension_question_spanish)
+
+            if checker_settings.enabled and checker_settings.mode != "off":
+                _ck = make_check_key(
+                    checker_settings,
+                    pair.english,
+                    pair.spanish,
+                    pair.literal_spanish,
+                )
+                _cr = checker_results.get(_ck)
+                if _cr is not None:
+                    _render_checker_details(
+                        _cr,
+                        checker_settings.detailed_diagnostics,
+                        tts_lang,
+                    )
+
+    # ── On-demand enrichment button ───────────────────────────────────────────
+    # Shown in the Study tab when the chunk was translated without enrichments.
+    if result_idx is not None:
+        _has_enrichments = any(
+            p.vocabulary or p.grammar_notes or p.literal_spanish
+            for p in result.pairs
+        )
+        if not _has_enrichments:
+            if st.button(
+                "⚡ Add vocab, grammar & literal Spanish",
+                key=f"enrich_{result_idx}",
+                help="Re-translate this chunk with all enrichments enabled.",
+            ):
+                st.session_state._enrich_idx = result_idx
+                st.rerun()
+
+
 # -----------------------------
 # Sidebar
 # -----------------------------
@@ -987,7 +1079,9 @@ with st.sidebar:
         help="qwen2.5:3b is fastest on CPU. qwen2.5:7b is the default. qwen2.5:14b is highest quality.",
     )
 
+    _check_started = time.monotonic()
     ok, status = check_ollama(selected_model)
+    status = f"{status} (checked{_elapsed_suffix(_check_started)})"
 
     if ok:
         st.success(status)
@@ -1097,20 +1191,36 @@ ollama pull qwen2.5:14b
         help="Lower = more consistent JSON output. Keep below 0.3 for reliable structured translation.",
     )
 
-    include_literal = st.checkbox(
-        "Include literal Spanish",
-        value=True,
+    _env_include_enrichments = os.getenv(
+        "TRANSLATION_INCLUDE_ENRICHMENTS", "true"
+    ).strip().lower() not in ("false", "0", "no", "off")
+    _skip_enrichments = st.checkbox(
+        "⚡ Skip enrichments (faster)",
+        value=not _env_include_enrichments,
+        help=(
+            "Skip literal Spanish, vocabulary, and grammar notes. "
+            "The model returns only English + Spanish pairs, which is significantly faster. "
+            "Uncheck to re-enable enrichments."
+        ),
     )
 
+
+    include_literal = False
     include_vocab = st.checkbox(
         "Include vocabulary",
         value=True,
+        disabled=_skip_enrichments,
     )
+    if _skip_enrichments:
+        include_vocab = False
 
     include_grammar = st.checkbox(
         "Include grammar notes",
         value=True,
+        disabled=_skip_enrichments,
     )
+    if _skip_enrichments:
+        include_grammar = False
 
     with st.expander("🔍 Output Checker"):
         # Derive sidebar defaults from env vars so Docker/local overrides take effect
@@ -1119,11 +1229,11 @@ ollama pull qwen2.5:14b
             "false", "0", "no", "off"
         )
         _env_checker_mode = os.getenv("CHECKER_MODE", "smart").strip().lower()
-        _checker_mode_options = ["off", "fast", "smart", "strict"]
+        _checker_mode_options = ["instant", "off", "fast", "smart", "strict"]
         _env_checker_mode_idx = (
             _checker_mode_options.index(_env_checker_mode)
             if _env_checker_mode in _checker_mode_options
-            else 2
+            else 3  # default to smart
         )
         _env_checker_llm = os.getenv("CHECKER_LLM_ENABLED", "true").strip().lower() not in (
             "false", "0", "no", "off"
@@ -1144,10 +1254,11 @@ ollama pull qwen2.5:14b
             _checker_mode_options,
             index=_env_checker_mode_idx,
             help=(
-                "off: no checks. "
-                "fast: deterministic checks only (no extra model calls). "
-                "smart: deterministic + LLM for risky/sampled pairs. "
-                "strict: deterministic + LLM for every pair."
+                "instant: translate and show immediately, no checker.\n"
+                "off: no checks.\n"
+                "fast: show first, then deterministic checks only (no extra model calls).\n"
+                "smart: show first, then deterministic + LLM for risky pairs.\n"
+                "strict: deterministic + LLM + retry before showing result."
             ),
         )
         checker_model_ui = st.text_input(
@@ -1175,9 +1286,7 @@ ollama pull qwen2.5:14b
     if st.button("Clear session"):
         set_source_text("")
         st.session_state.checker_results = {}
-        st.session_state._translation_cache = {}
-        st.session_state.abort_requested = False
-        st.session_state._translating = False
+        st.session_state._translation_cache.clear()
         st.session_state._cached_markdown_key = None
         st.session_state._cached_markdown = None
         st.session_state.pop("_last_upload_key", None)
@@ -1243,6 +1352,7 @@ else:
         if st.session_state.get("_last_upload_key") != _upload_key:
             try:
                 size_mb = uploaded.size / 1024 / 1024
+                _extract_started = time.monotonic()
                 with st.spinner(f"Extracting {suffix.upper()} ({size_mb:.1f} MB)…"):
                     if suffix == "pdf":
                         set_source_text(extract_pdf_text(uploaded))
@@ -1251,7 +1361,10 @@ else:
                     else:
                         set_source_text(extract_plain_text(uploaded))
                 st.session_state["_last_upload_key"] = _upload_key
-                st.success(f"Extracted {len(st.session_state.raw_text):,} characters")
+                st.success(
+                    f"Extracted {len(st.session_state.raw_text):,} characters"
+                    f"{_elapsed_suffix(_extract_started)}"
+                )
 
             except Exception as exc:
                 st.error(f"Could not extract text: {exc}")
@@ -1347,34 +1460,34 @@ if chunks:
             if _pi < _prev_start + len(_prev_chunks):
                 st.divider()
 
-_btn_col, _stop_col = st.columns([5, 1])
-_translate_clicked = _btn_col.button(
+_translate_clicked = st.button(
     "Translate selected chunks",
     type="primary",
     disabled=not chunks or not ok,
 )
-_stop_clicked = _stop_col.button(
-    "⏹ Stop",
-    disabled=not st.session_state._translating,
-    help="Stops translation after the current chunk finishes.",
-)
-if _stop_clicked:
-    st.session_state.abort_requested = True
+
+_checker_changed_translation = False
 
 if _translate_clicked:
-    st.session_state.abort_requested = False
-    st.session_state._translating = True
     st.session_state._cached_markdown_key = None  # invalidate cached export
 
     start = int(start_index) - 1
     selected_chunks = chunks[start : start + chunks_to_process]
     failed_chunks = []
+    _n_chunks = len(selected_chunks)
+    _workflow_started = time.monotonic()
+    _progress_bar = st.progress(0, text="Preparing translation workflow…")
 
     for idx, chunk in enumerate(selected_chunks, start=start + 1):
-        if st.session_state.abort_requested:
-            st.warning(f"Translation stopped by user after chunk {idx - 1}.")
-            break
-
+        _ci = idx - start  # 1-based position within the selected range
+        _progress_bar.progress(
+            _overall_progress(_ci, _n_chunks, 0.0),
+            text=f"Chunk {_ci} of {_n_chunks}: preparing…",
+        )
+        _progress_bar.progress(
+            _overall_progress(_ci, _n_chunks, 0.15),
+            text=f"Chunk {_ci} of {_n_chunks}: translating…",
+        )
         result = None
         _t_chunk_start = time.monotonic()
 
@@ -1425,7 +1538,7 @@ if _translate_clicked:
                         state="complete",
                         expanded=False,
                     )
-                    st.session_state._translation_cache[_cache_key] = result
+                    st.session_state._translation_cache.put(_cache_key, result)
                 st.session_state.results.append(result)
 
             except requests.exceptions.ConnectionError as exc:
@@ -1463,14 +1576,43 @@ if _translate_clicked:
                 failed_chunks.append(idx)
 
         # Run checker after successful translation (not on Streamlit rerenders).
+        # Smart/strict can retranslate rejected pairs, then rerun so the updated
+        # translation is visible in the same session.
         # Pairs are checked concurrently up to CHECKER_BATCH_SIZE workers.
-        if result is not None and checker_settings.enabled and checker_settings.mode != "off":
-            _batch = max(checker_settings.batch_size, 1)
+        _eff_mode = checker_settings.mode if checker_settings.enabled else "off"
+        _is_strict = (_eff_mode == "strict")
+        _checker_changed_translation = False
+        _run_checker = result is not None and _eff_mode not in ("off", "instant")
+
+        # ── Render immediately for instant / fast / smart ────────────────────
+        if result is not None and not _is_strict:
+            st.markdown(
+                f'<span class="small-muted">✓ Chunk {idx} of {len(selected_chunks)} translated</span>',
+                unsafe_allow_html=True,
+            )
+            render_result_card(
+                result,
+                checker_results=st.session_state.checker_results,
+                checker_settings=checker_settings,
+                include_literal=include_literal,
+                tts_lang=tts_lang,
+            )
+
+        if _run_checker:
+            # fast mode is deterministic-only (no GPU calls): use det_workers.
+            # smart / strict may invoke the LLM: respect llm_concurrency.
+            _uses_llm = _eff_mode in ("smart", "strict")
+            _batch = max(
+                checker_settings.llm_concurrency if _uses_llm else checker_settings.det_workers,
+                1,
+            )
+            _checker_started = time.monotonic()
             with st.status(
                 f"Checking {len(result.pairs)} pair(s)…",
                 expanded=False,
             ) as _chk_status:
                 _cached_snapshot = dict(st.session_state.checker_results)
+                _checked_pairs = 0
                 with ThreadPoolExecutor(max_workers=_batch) as _pool:
                     _futures = [
                         _pool.submit(
@@ -1488,18 +1630,34 @@ if _translate_clicked:
                         try:
                             _ck, _cr = _future.result()
                             st.session_state.checker_results[_ck] = _cr
+                            _checked_pairs += 1
+                            _progress_bar.progress(
+                                _overall_progress(
+                                    _ci,
+                                    _n_chunks,
+                                    0.55 + (0.30 * _checked_pairs / max(len(result.pairs), 1)),
+                                ),
+                                text=(
+                                    f"Chunk {_ci} of {_n_chunks}: checking pair "
+                                    f"{_checked_pairs} of {len(result.pairs)}"
+                                ),
+                            )
                         except Exception as _fut_exc:
                             logger.warning(
                                 "Checker worker raised an exception: %s", _fut_exc
                             )
                 _chk_status.update(
-                    label=f"Checked {len(result.pairs)} pair(s)",
+                    label=f"Checked {len(result.pairs)} pair(s){_elapsed_suffix(_checker_started)}",
                     state="complete",
                 )
 
-        # Retranslate any pairs the checker marked as failed.
-        # Only one retry attempt per pair to avoid infinite loops.
-        if result is not None and checker_settings.enabled and checker_settings.mode != "off":
+            _progress_bar.progress(
+                _overall_progress(_ci, _n_chunks, 0.85),
+                text=f"Chunk {_ci} of {_n_chunks}: checker complete",
+            )
+
+        # Retranslate pairs flagged by the checker.
+        if result is not None and _eff_mode in ("fast", "smart", "strict"):
             _pairs_to_retry = []
             for _pidx, _pair in enumerate(result.pairs):
                 _ck = make_check_key(
@@ -1509,10 +1667,11 @@ if _translate_clicked:
                     _pair.literal_spanish,
                 )
                 _cr = st.session_state.checker_results.get(_ck)
-                if _cr is not None and _cr.severity == "fail":
+                if _cr is not None and should_retry_translation(checker_settings, _cr):
                     _pairs_to_retry.append((_pidx, _pair, _ck, _cr))
 
             if _pairs_to_retry:
+                _retry_started = time.monotonic()
                 with st.status(
                     f"Correcting {len(_pairs_to_retry)} failed pair(s)…",
                     expanded=True,
@@ -1523,21 +1682,52 @@ if _translate_clicked:
                             f"Pair {_pidx + 1}: {_cr.user_facing_summary}"
                         )
                         try:
-                            _new_pair = retranslate_pair(
-                                pair=_pair,
-                                check_result=_cr,
-                                level=level,
-                                style=style,
-                                region=region,
-                                fidelity=fidelity,
-                                include_literal=include_literal,
-                                include_vocab=include_vocab,
-                                include_grammar=include_grammar,
-                                temperature=temperature,
-                                model=selected_model,
-                                corrected_spanish_hint=_cr.corrected_spanish,
-                            )
+                            _original_spanish = _pair.spanish
+                            _used_checker_correction = False
+
+                            # Prefer the checker's explicit corrected Spanish when available.
+                            # This avoids losing a valid correction if the separate retry call
+                            # fails, times out, or returns invalid JSON.
+                            if _cr.corrected_spanish and _cr.corrected_spanish.strip():
+                                _direct_fix = _strip_ellipsis(_cr.corrected_spanish)
+
+                                if _direct_fix:
+                                    _new_pair = _pair.model_copy(deep=True)
+                                    _new_pair.spanish = _direct_fix
+                                    _used_checker_correction = True
+                                else:
+                                    _new_pair = retranslate_pair(
+                                        pair=_pair,
+                                        check_result=_cr,
+                                        level=level,
+                                        style=style,
+                                        region=region,
+                                        fidelity=fidelity,
+                                        include_literal=include_literal,
+                                        include_vocab=include_vocab,
+                                        include_grammar=include_grammar,
+                                        temperature=temperature,
+                                        model=selected_model,
+                                        corrected_spanish_hint="",
+                                    )
+                            else:
+                                _new_pair = retranslate_pair(
+                                    pair=_pair,
+                                    check_result=_cr,
+                                    level=level,
+                                    style=style,
+                                    region=region,
+                                    fidelity=fidelity,
+                                    include_literal=include_literal,
+                                    include_vocab=include_vocab,
+                                    include_grammar=include_grammar,
+                                    temperature=temperature,
+                                    model=selected_model,
+                                    corrected_spanish_hint="",
+                                )
+
                             result.pairs[_pidx] = _new_pair
+                            _checker_changed_translation = True
                             # Remove stale checker result and re-check the corrected pair.
                             st.session_state.checker_results.pop(_old_ck, None)
                             _new_ck, _new_cr = check_pair(
@@ -1549,7 +1739,33 @@ if _translate_clicked:
                                 cached_results={},  # force fresh check
                             )
                             st.session_state.checker_results[_new_ck] = _new_cr
-                            _retry_success += 1
+
+                            _changed_spanish = (
+                                _norm_text_for_compare(_new_pair.spanish)
+                                != _norm_text_for_compare(_original_spanish)
+                            )
+                            # Treat only blocking failures as unresolved.
+                            # Minor warning/info follow-up suggestions should not
+                            # surface as a failed correction attempt in the UI.
+                            _blocking_unresolved = (
+                                _new_cr.severity == "fail" or not _new_cr.passed
+                            )
+
+                            if _changed_spanish:
+                                _new_pair.corrected_by_checker = True
+                                _new_pair.correction_note = (
+                                    "Applied checker correction"
+                                    if _used_checker_correction
+                                    else "Updated after checker retry"
+                                )
+
+                            if _changed_spanish and not _blocking_unresolved:
+                                _retry_success += 1
+                            elif _blocking_unresolved:
+                                _retry_status.write(
+                                    "  ⚠️ Correction did not fully resolve this pair; "
+                                    "the latest checked output is still shown."
+                                )
                         except Exception as _retry_exc:
                             logger.warning(
                                 "Retranslation failed for pair %d: %s",
@@ -1565,24 +1781,112 @@ if _translate_clicked:
                         else f"Corrected {_retry_success} pair(s)"
                     )
                     _retry_status.update(
-                        label=_retry_label,
+                        label=f"{_retry_label}{_elapsed_suffix(_retry_started)}",
                         state="complete",
                     )
 
-    st.session_state._translating = False
+
+                if _checker_changed_translation:
+                    st.session_state._cached_markdown_key = None
+                    st.session_state._cached_markdown = None
+
+
+                _progress_bar.progress(
+                    _overall_progress(_ci, _n_chunks, 0.95),
+                    text=f"Chunk {_ci} of {_n_chunks}: corrections complete",
+                )
+            else:
+                _progress_bar.progress(
+                    _overall_progress(_ci, _n_chunks, 0.95),
+                    text=f"Chunk {_ci} of {_n_chunks}: no corrections needed",
+                )
+
+        # ── Render in strict mode (after checker + retry) ────────────────────
+        if result is not None and _is_strict:
+            st.markdown(
+                f'<span class="small-muted">\u2713 Chunk {idx} of {len(selected_chunks)} translated</span>',
+                unsafe_allow_html=True,
+            )
+            render_result_card(
+                result,
+                checker_results=st.session_state.checker_results,
+                checker_settings=checker_settings,
+                include_literal=include_literal,
+                tts_lang=tts_lang,
+            )
+
+        _progress_bar.progress(
+            _overall_progress(_ci, _n_chunks, 1.0),
+            text=f"Chunk {_ci} of {_n_chunks}: complete",
+        )
+
+    _progress_bar.progress(1.0, text=f"All {_n_chunks} chunk(s) complete ✓")
+    _workflow_elapsed = time.monotonic() - _workflow_started
 
     if failed_chunks:
         st.warning(
             f"{len(failed_chunks)} chunk(s) failed: {failed_chunks}. "
-            "You can retry or continue viewing successful results."
+            f"You can retry or continue viewing successful results. Workflow time: {_workflow_elapsed:.1f}s."
         )
+    else:
+        st.caption(f"Workflow time: {_workflow_elapsed:.1f}s")
 
 
-# -----------------------------
-# Study tabs
-# -----------------------------
 
-if st.session_state.results:
+    # Force Streamlit into the normal post-translation render.
+    # During the button-click render, the Study tabs are intentionally skipped
+    # by `if st.session_state.results and not _translate_clicked`.
+    # Without this rerun, Spanish First / Vocabulary / Export may not appear
+    # until the user interacts with the app again.
+    if st.session_state.results and len(failed_chunks) < _n_chunks:
+        st.rerun()
+
+
+# ── On-demand enrichment handler ─────────────────────────────────────────────
+# Runs when the user clicked "⚡ Add vocab, grammar & literal Spanish" in the
+# Study tab. Retranslates the chunk with all enrichments forced on, then
+# updates the stored result in-place.
+if (
+    not _translate_clicked
+    and st.session_state._enrich_idx is not None
+    and st.session_state.results
+):
+    _eidx = st.session_state._enrich_idx
+    if 0 <= _eidx < len(st.session_state.results):
+        _eresult = st.session_state.results[_eidx]
+        _echunk = "\n\n".join(p.english for p in _eresult.pairs)
+        _enrich_started = time.monotonic()
+        with st.spinner(
+            f"Enriching chunk {_eidx + 1} of {len(st.session_state.results)}…"
+        ):
+            try:
+                _enriched = translate_chunk(
+                    chunk=_echunk,
+                    level=level,
+                    style=style,
+                    region=region,
+                    fidelity=fidelity,
+                    include_literal=True,
+                    include_vocab=True,
+                    include_grammar=True,
+                    temperature=temperature,
+                    model=selected_model,
+                )
+                st.session_state.results[_eidx] = _enriched
+            except Exception as _enrich_exc:
+                st.error(f"Enrichment failed: {_enrich_exc}")
+            else:
+                st.success(
+                    f"Enriched chunk {_eidx + 1} of {len(st.session_state.results)}"
+                    f"{_elapsed_suffix(_enrich_started)}"
+                )
+    st.session_state._enrich_idx = None
+    st.rerun()
+
+# Study tabs — shown on rerenders after translation completes.
+# Skipped on the translate-click render because chunks are rendered
+# progressively inline above; Study tabs appear on the next interaction.
+if st.session_state.results and not _translate_clicked:
     st.subheader("3. Study")
 
     _total_pairs = sum(len(r.pairs) for r in st.session_state.results)
@@ -1605,81 +1909,26 @@ if st.session_state.results:
                     _p.literal_spanish,
                 )
 
-    tab_reader, tab_spanish, tab_vocab, tab_export = st.tabs(
-        [
-            f"📖 Parallel Reader ({_total_pairs})",
-            f"🇪🇸 Spanish First ({_total_pairs})",
-            f"🧠 Vocabulary ({_total_vocab})",
-            "⬇️ Export",
-        ]
-    )
+    
+    _tab_labels = [
+        f"📖 Parallel Reader ({_total_pairs})",
+        f"🇪🇸 Spanish First ({_total_pairs})",
+        f"🧠 Vocabulary ({_total_vocab})",
+        "⬇️ Export",
+    ]
+
+    tab_reader, tab_spanish, tab_vocab, tab_export = st.tabs(_tab_labels)
 
     with tab_reader:
-        for result in st.session_state.results:
-            if result.title:
-                st.markdown(f"### {result.title}")
-
-            if result.summary_english or result.summary_spanish:
-                with st.expander("Summary"):
-                    if result.summary_english:
-                        st.markdown("**English summary**")
-                        st.write(result.summary_english)
-
-                    if result.summary_spanish:
-                        st.markdown("**Spanish summary**")
-                        st.write(result.summary_spanish)
-                        render_tts_button(result.summary_spanish, lang=tts_lang)
-
-            for pair in result.pairs:
-                with st.container(border=True):
-                    left, right = st.columns(2)
-
-                    with left:
-                        st.markdown("**English**")
-                        st.markdown(
-                            f'<p class="passage-text">{_html.escape(pair.english).replace(chr(10), "<br>")}</p>',
-                            unsafe_allow_html=True,
-                        )
-
-                    with right:
-                        st.markdown("**Español**")
-                        st.markdown(
-                            f'<p class="passage-text">{_html.escape(pair.spanish).replace(chr(10), "<br>")}</p>',
-                            unsafe_allow_html=True,
-                        )
-                        st.markdown(
-                            f'<span style="background:#e0f2fe;color:#0369a1;'
-                            f'padding:2px 8px;border-radius:4px;'
-                            f'font-size:0.82rem;font-weight:600;">'
-                            f'{pair.difficulty}</span>',
-                            unsafe_allow_html=True,
-                        )
-                        render_tts_button(pair.spanish, lang=tts_lang)
-
-                    if include_literal and pair.literal_spanish:
-                        with st.expander("Literal Spanish"):
-                            st.write(pair.literal_spanish)
-
-                    if pair.grammar_notes:
-                        with st.expander("Grammar notes"):
-                            st.markdown(
-                                "\n".join(f"- {note}" for note in pair.grammar_notes)
-                            )
-
-                    if pair.comprehension_question_spanish:
-                        with st.expander("Comprehension question"):
-                            st.write(pair.comprehension_question_spanish)
-
-                    # Checker result for this pair (only from session_state — no new call)
-                    if checker_settings.enabled and checker_settings.mode != "off":
-                        _ck = _pair_check_keys.get(id(pair))
-                        _cr = st.session_state.checker_results.get(_ck) if _ck else None
-                        if _cr is not None:
-                            _render_checker_details(
-                                _cr,
-                                checker_settings.detailed_diagnostics,
-                                tts_lang,
-                            )
+        for _ridx, result in enumerate(st.session_state.results):
+            render_result_card(
+                result,
+                checker_results=st.session_state.checker_results,
+                checker_settings=checker_settings,
+                include_literal=include_literal,
+                tts_lang=tts_lang,
+                result_idx=_ridx,
+            )
 
     with tab_spanish:
         st.caption(
@@ -1694,6 +1943,9 @@ if st.session_state.results:
                     f"**Passage {i} / {len(result.pairs)}**",
                 )
                 st.write(pair.spanish)
+                if pair.corrected_by_checker:
+                    _note = pair.correction_note or "Updated after checker correction"
+                    st.caption(f"✅ Corrected by checker: {_note}")
                 render_tts_button(pair.spanish, lang=tts_lang)
 
                 with st.expander("Reveal English"):
@@ -1728,14 +1980,35 @@ if st.session_state.results:
             )
 
         else:
-            st.info("No vocabulary generated yet.")
+            st.info(
+                "No vocabulary generated yet. If you translated with "
+                "'Skip enrichments' enabled, use the enrichments button in "
+                "the Parallel Reader tab to add vocabulary."
+            )
 
     with tab_export:
         # Cache the markdown string; rebuild only when results or checker data change.
+        
         _mk_cache_key = (
-            len(st.session_state.results),
+            tuple(
+                (
+                    pair.english,
+                    pair.spanish,
+                    pair.literal_spanish,
+                    tuple((v.spanish, v.english, v.note) for v in pair.vocabulary),
+                    tuple(pair.grammar_notes),
+                    pair.comprehension_question_spanish,
+                    pair.corrected_by_checker,
+                    pair.correction_note,
+                )
+                for result in st.session_state.results
+                for pair in result.pairs
+            ),
             len(st.session_state.checker_results),
+            include_literal,
+            checker_settings.detailed_diagnostics,
         )
+
         if st.session_state._cached_markdown_key != _mk_cache_key:
             markdown = []
 
@@ -1754,6 +2027,7 @@ if st.session_state.results:
                     )
 
                 for pair in result.pairs:
+                    
                     markdown += [
                         "---\n",
                         "## English\n",
@@ -1761,6 +2035,13 @@ if st.session_state.results:
                         "## Español\n",
                         pair.spanish + "\n",
                     ]
+
+                    if pair.corrected_by_checker:
+                        markdown += [
+                            "> ✅ **Corrected by checker:** "
+                            f"{pair.correction_note or 'Applied checker correction'}\n"
+                        ]
+
 
                     if include_literal and pair.literal_spanish:
                         markdown += [

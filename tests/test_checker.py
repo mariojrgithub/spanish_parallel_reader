@@ -28,6 +28,7 @@ from checker import (
     get_checker_settings,
     make_check_key,
     should_run_llm_checker,
+    should_retry_translation,
     truncate_for_checker,
 )
 
@@ -56,6 +57,8 @@ def _settings(
         detailed_diagnostics=False,
         llm_enabled=llm_enabled,
         batch_size=1,
+        det_workers=4,
+        llm_concurrency=1,
         ollama_host="http://localhost:11434",
     )
 
@@ -228,6 +231,32 @@ def test_llm_disabled_never_runs():
         assert not should_run_llm_checker(settings, risk_score=1.0, pair_index=0)
 
 
+def test_retry_translation_only_in_smart_or_strict_modes():
+    failing_result = PairCheckResult(
+        passed=False,
+        severity="fail",
+        score=0.2,
+        user_facing_summary="Meaning reversed.",
+    )
+
+    assert not should_retry_translation(_settings(mode="off"), failing_result)
+    assert not should_retry_translation(_settings(mode="fast"), failing_result)
+    assert should_retry_translation(_settings(mode="smart"), failing_result)
+    assert should_retry_translation(_settings(mode="strict"), failing_result)
+
+
+def test_retry_translation_triggers_when_checker_suggests_correction():
+    corrected = PairCheckResult(
+        passed=True,
+        severity="warning",
+        score=0.7,
+        corrected_spanish="El perro corre rápido cada mañana.",
+        user_facing_summary="Minor issue.",
+    )
+
+    assert should_retry_translation(_settings(mode="smart"), corrected)
+
+
 # ── Cache key ─────────────────────────────────────────────────────────────────
 
 def test_cache_key_stable_for_identical_inputs():
@@ -309,7 +338,7 @@ def test_mocked_llm_checker_pass():
         "user_facing_summary": "Translation looks good.",
     }
     settings = _settings(mode="strict")  # strict → always LLM
-    with mock.patch("checker._http_session.post", return_value=_mock_llm_response(llm_data)):
+    with mock.patch("infrastructure.ollama_client.session.post", return_value=_mock_llm_response(llm_data)):
         _, result = check_pair(
             settings=settings,
             english=_GOOD_EN,
@@ -336,7 +365,7 @@ def test_mocked_llm_checker_fail():
         "user_facing_summary": "Hallucination detected.",
     }
     settings = _settings(mode="strict")
-    with mock.patch("checker._http_session.post", return_value=_mock_llm_response(llm_data)):
+    with mock.patch("infrastructure.ollama_client.session.post", return_value=_mock_llm_response(llm_data)):
         _, result = check_pair(
             settings=settings,
             english=_GOOD_EN,
@@ -624,7 +653,7 @@ def test_merge_severity_deterministic_fail_overrides_llm_pass():
         "user_facing_summary": "Translation looks good.",
     }
     settings = _settings(mode="strict")
-    with mock.patch("checker._http_session.post", return_value=_mock_llm_response(llm_data)):
+    with mock.patch("infrastructure.ollama_client.session.post", return_value=_mock_llm_response(llm_data)):
         _, result = check_pair(
             settings=settings,
             english=_GOOD_EN,
@@ -659,7 +688,7 @@ def test_merge_severity_llm_fail_overrides_deterministic_pass():
         "user_facing_summary": "Meaning reversed.",
     }
     settings = _settings(mode="strict")
-    with mock.patch("checker._http_session.post", return_value=_mock_llm_response(llm_data)):
+    with mock.patch("infrastructure.ollama_client.session.post", return_value=_mock_llm_response(llm_data)):
         _, result = check_pair(
             settings=settings,
             english=_GOOD_EN,
@@ -689,7 +718,7 @@ def test_merge_severity_takes_worst_when_llm_warning_det_pass():
         "user_facing_summary": "Minor warning.",
     }
     settings = _settings(mode="strict")
-    with mock.patch("checker._http_session.post", return_value=_mock_llm_response(llm_data)):
+    with mock.patch("infrastructure.ollama_client.session.post", return_value=_mock_llm_response(llm_data)):
         _, result = check_pair(
             settings=settings,
             english=_GOOD_EN,
