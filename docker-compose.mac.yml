@@ -9,17 +9,18 @@ services:
       - "${APP_HOST_PORT:-8502}:8501"
     environment:
       OLLAMA_HOST: http://host.docker.internal:11434
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
-      AVAILABLE_OLLAMA_MODELS: ${AVAILABLE_OLLAMA_MODELS:-qwen2.5:3b,qwen2.5:7b,qwen2.5:14b}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b}
+      AVAILABLE_OLLAMA_MODELS: ${AVAILABLE_OLLAMA_MODELS:-qwen2.5:7b,qwen2.5:3b,qwen2.5:14b}
       OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
-      # 3b on Apple Silicon fits comfortably in 4096; 8192 risks OOM on 8 GB M3 Air.
+      # 4096 is a safe default on many Apple Silicon systems.
       OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-4096}
       OLLAMA_TEMPERATURE: ${OLLAMA_TEMPERATURE:-0.1}
       OLLAMA_TOP_P: ${OLLAMA_TOP_P:-0.9}
       OLLAMA_REQUEST_TIMEOUT: ${OLLAMA_REQUEST_TIMEOUT:-240}
-      # Small chunk size limits pairs-per-request so 3b doesn't drift on later pairs.
-      # 800 chars ≈ 2–3 pairs which is within 3b's reliable working memory.
-      MAX_CHARS_PER_CHUNK: ${MAX_CHARS_PER_CHUNK:-800}
+      # Keep the default aligned with the main compose profile.
+      # If users switch to qwen2.5:3b in the app, model-specific guardrails
+      # (smaller chunk cap + lower output budget warning) apply automatically.
+      MAX_CHARS_PER_CHUNK: ${MAX_CHARS_PER_CHUNK:-2200}
       TRANSLATION_CACHE_MAX_ENTRIES: ${TRANSLATION_CACHE_MAX_ENTRIES:-50}
       TRANSLATION_INCLUDE_ENRICHMENTS: ${TRANSLATION_INCLUDE_ENRICHMENTS:-true}
       CHECKER_ENABLED: ${CHECKER_ENABLED:-true}
