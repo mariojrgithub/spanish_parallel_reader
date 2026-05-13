@@ -1,84 +1,190 @@
-# Spanish Parallel Reader — Streamlit + Ollama
 
-Turns English reading material into a side-by-side Spanish parallel reader with vocabulary, grammar notes, literal translations, exportable study notes, and an **output quality checker** that validates translations before they are shown or exported.
+# Spanish Parallel Reader
 
-## Quick Start
+## Overview
+Spanish Parallel Reader is a Streamlit application that turns English reading material into a side-by-side Spanish parallel reader with vocabulary, grammar notes, literal translations, exportable study notes, and an output quality checker. All translation and checking runs locally using Ollama LLMs—no cloud APIs required.
 
-### Prerequisites
+## Features
+- Translate and align English text into Spanish at various CEFR levels
+- Vocabulary, grammar notes, literal translation, and comprehension questions
+- Output quality checker (deterministic and LLM-based)
+- Export study notes as Markdown
+- PDF, DOCX, TXT, and Markdown file support
+- Text-to-speech (browser-based)
 
-- Docker and Docker Compose installed
-- 8 GB RAM minimum for `qwen2.5:7b` (16 GB recommended); `qwen2.5:14b` requires ~12 GB
-- Optional: NVIDIA GPU with 8 GB+ VRAM for faster inference
+## Project Structure
 
-### Setup
+```
+app.py                # Main Streamlit app entry point
+checker.py            # Output quality checker logic
+text_processing.py    # Text extraction, cleaning, chunking
+tts_component.py      # Browser-based TTS controls
+infrastructure/       # Ollama client helpers
+benchmarks/           # Benchmark scripts
+tests/                # Pytest-based test suite
+Dockerfile            # App container
+docker-compose.yml    # Default (CPU) Docker Compose
+docker-compose.gpu.yml# GPU-enabled Docker Compose
+docker-compose.mac.yml# Mac-specific Docker Compose (host Ollama)
+requirements.txt      # Python dependencies
+.env.example          # Example environment config
+.streamlit/config.toml# Streamlit config
+```
 
-1. Clone the repository:
+## Requirements
+- Python 3.12+ (for local development)
+- pip (for dependency management)
+- Docker & Docker Compose (for containerized usage)
+- Ollama (for local LLM inference)
+
+## Configuration
+Copy `.env.example` to `.env` and edit as needed. All variables have safe defaults.
+
+Key environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLLAMA_MODEL` | `qwen2.5:7b` | Default translation model |
+| `AVAILABLE_OLLAMA_MODELS` | `qwen2.5:7b,qwen2.5:3b,qwen2.5:14b` | Models shown in UI selector |
+| `OLLAMA_HOST` | `http://ollama:11434` (Docker) / `http://localhost:11434` (local) | Ollama API endpoint |
+| `APP_HOST_PORT` | `8502` | Host port for Streamlit app |
+| `OLLAMA_KEEP_ALIVE` | `-1` | Keep model in memory |
+| `OLLAMA_NUM_CTX` | `8192` | Context window size |
+| `MAX_CHARS_PER_CHUNK` | `2200` | Max chars per translation chunk |
+| `TRANSLATION_CACHE_MAX_ENTRIES` | `50` | Translation cache size |
+| `TRANSLATION_INCLUDE_ENRICHMENTS` | `true` | Include vocab/grammar/literal |
+| `CHECKER_ENABLED` | `true` | Enable output checker |
+| `CHECKER_MODE` | `smart` | Checker mode (off/fast/smart/strict) |
+| `CHECKER_REQUIRE_PASS` | `false` | Block export on checker fail |
+| `ENABLE_TTS` | `true` | Enable browser TTS |
+| `TTS_LANGUAGE` | `es-MX` | TTS language |
+| `TTS_RATE` | `0.9` | TTS speech rate |
+
+See `.env.example` for all options and documentation.
+
+## Local Development Setup
+
+1. Install Python 3.12+ and pip.
+2. Create and activate a virtual environment:
    ```bash
-   git clone <repo-url>
-   cd spanish_parallel_reader
+   python -m venv .venv
+   source .venv/bin/activate  # or .venv\Scripts\activate on Windows
+   ```
+3. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+4. Start Ollama and pull the required model:
+   ```bash
+   ollama serve
+   ollama pull qwen2.5:7b
+   # Optionally: ollama pull qwen2.5:14b
+   ```
+5. Run the app:
+   ```bash
+   OLLAMA_HOST=http://localhost:11434 streamlit run app.py
    ```
 
-2. Create `.env` from `.env.example`:
-   ```bash
-   cp .env.example .env
-   ```
+## macOS Local Ollama Setup
 
-3. Pull the default model (required before first run without Docker auto-pull):
+1. [Install Ollama for macOS](https://ollama.com/download).
+2. Start Ollama:
+   ```bash
+   ollama serve
+   ```
+3. Pull the required model(s):
    ```bash
    ollama pull qwen2.5:7b
-   # Optional — higher quality, more RAM:
-   ollama pull qwen2.5:14b
+   ollama pull qwen2.5:14b  # optional, more RAM required
    ```
-
-4. Start with Docker Compose (CPU):
+4. To run the app locally (no Docker):
    ```bash
-   docker compose up --build
+   pip install -r requirements.txt
+   OLLAMA_HOST=http://localhost:11434 streamlit run app.py
    ```
-
-   For GPU support:
-   ```bash
-   docker compose -f docker-compose.gpu.yml up --build
-   ```
-
-   For macOS with Ollama running locally:
+5. To run the app in Docker but use your Mac's Ollama:
    ```bash
    docker compose -f docker-compose.mac.yml up --build
+   # This uses host.docker.internal:11434 for OLLAMA_HOST
    ```
+6. Open http://localhost:8502 in your browser.
 
-5. Open your browser:
-   ```
-   http://localhost:8502
-   ```
+**Troubleshooting (macOS):**
+- If the Docker app cannot reach Ollama, ensure Ollama is running and the compose file is `docker-compose.mac.yml`.
+- If you see connection errors, check that `OLLAMA_HOST` is set to `http://host.docker.internal:11434` in the Docker environment.
+- If the model is missing, run `ollama pull qwen2.5:7b` on your Mac.
+- For port conflicts, change `APP_HOST_PORT` in `.env` and restart Docker Compose.
 
-> **First startup:** `qwen2.5:7b` (~4.7 GB) will be pulled automatically by the `ollama-pull` service. This takes 5–10 minutes on first run. Subsequent starts reuse the cached model.
+## Running with Docker
 
-### Run locally (without Docker)
 
+**Default (CPU):**
 ```bash
-pip install -r requirements.txt
-OLLAMA_HOST=http://localhost:11434 streamlit run app.py
+docker compose up --build
+```
+*This profile defaults to `qwen2.5:3b` for maximum compatibility on lower-memory systems. The 7B and 14B models are also available as options.*
+
+**With GPU:**
+```bash
+docker compose -f docker-compose.gpu.yml up --build
+```
+*This profile defaults to `qwen2.5:7b` for best quality/speed on GPU. The 3B and 14B models are also available as options.*
+
+**On macOS with local Ollama:**
+```bash
+docker compose -f docker-compose.mac.yml up --build
+```
+*This profile defaults to `qwen2.5:7b` for best quality/speed. The 3B and 14B models are also available as options.*
+
+Open http://localhost:8502 in your browser.
+
+## Usage
+
+1. Upload a file or paste English text.
+2. Select your desired CEFR level, region, and translation style.
+3. Click "Translate".
+4. Review the Spanish output, vocabulary, grammar notes, and literal translation.
+5. Use the output checker to validate translations.
+6. Export study notes as Markdown.
+
+## Testing and Quality Checks
+
+Run all tests with:
+```bash
+pytest
 ```
 
-Requires Ollama running locally with `qwen2.5:7b` pulled.
+## Troubleshooting
+
+- **Ollama not reachable:**
+  - Ensure Ollama is running (`ollama serve`).
+  - For Docker, check the `ollama` service is healthy (`docker compose ps`).
+  - Check `OLLAMA_HOST` in `.env`.
+- **Model not found:**
+  - Run `ollama pull qwen2.5:7b` (or `qwen2.5:14b`).
+  - In Docker, the `ollama-pull` service pulls automatically on startup.
+- **Docker networking issues (macOS):**
+  - Use `docker-compose.mac.yml` and ensure `OLLAMA_HOST` is `http://host.docker.internal:11434`.
+- **Out of memory:**
+  - Use `qwen2.5:7b` instead of `qwen2.5:14b`.
+  - Lower `MAX_CHARS_PER_CHUNK` or `OLLAMA_NUM_CTX` in `.env`.
+- **Port conflicts:**
+  - Change `APP_HOST_PORT` in `.env` and restart Docker Compose.
+- **Checker issues:**
+  - See sidebar for checker status and logs.
+- **Dependency install issues:**
+  - Ensure Python 3.12+ and pip are installed.
+  - Use a clean virtual environment.
+
+## Maintenance Notes
+
+- When changing models, ports, or environment variables, update `.env.example` and this README.
+- Keep Docker Compose files and environment variable docs in sync.
+- Test both local and Docker workflows after major changes.
 
 ---
 
-## Models
 
-| Model | Default | RAM | License |
-|-------|---------|-----|---------|
-| `qwen2.5:7b` | ✅ Yes | ~6–8 GB | Apache 2.0 |
-| `qwen2.5:14b` | No | ~12 GB | Apache 2.0 |
-
-Select the model in the **Ollama model** dropdown in the sidebar. The selection is applied per translation session.
-
-To change the persisted default, set `OLLAMA_MODEL` in `.env`:
-```env
-OLLAMA_MODEL=qwen2.5:7b
-AVAILABLE_OLLAMA_MODELS=qwen2.5:7b,qwen2.5:14b
-```
-
----
 
 ## Environment Variables
 
@@ -97,24 +203,30 @@ AVAILABLE_OLLAMA_MODELS=qwen2.5:7b,qwen2.5:14b
 
 ---
 
+
 ## Troubleshooting
 
-**Ollama not reachable**
-- Docker: ensure the `ollama` service is healthy (`docker compose ps`).
-- Local: ensure Ollama is running (`ollama serve`).
-- Check `OLLAMA_HOST` in `.env` — use `http://ollama:11434` in Docker, `http://localhost:11434` locally.
-
-**Model not found**
-- Pull the model: `ollama pull qwen2.5:7b` or `ollama pull qwen2.5:14b`.
-- In Docker, the `ollama-pull` service pulls automatically on startup.
-
-**Insufficient memory**
-- Use `qwen2.5:7b` instead of `qwen2.5:14b`.
-- Reduce `MAX_CHARS_PER_CHUNK` in `.env` (e.g. `1200`).
-- Lower `OLLAMA_NUM_CTX` (e.g. `4096`).
-
-**Docker networking issues (macOS)**
-- Use `docker compose -f docker-compose.mac.yml` which routes Ollama via `host.docker.internal`.
+- **Ollama not reachable:**
+   - Ensure Ollama is running (`ollama serve`).
+   - For Docker, check the `ollama` service is healthy (`docker compose ps`).
+   - Check `OLLAMA_HOST` in `.env` — use `http://ollama:11434` in Docker, `http://localhost:11434` locally.
+- **Model not found:**
+   - Run `ollama pull qwen2.5:3b`, `ollama pull qwen2.5:7b`, or `ollama pull qwen2.5:14b` as needed.
+   - In Docker, the `ollama-pull` service pulls automatically on startup.
+- **Insufficient memory:**
+   - Use `qwen2.5:3b` or `qwen2.5:7b` instead of `qwen2.5:14b`.
+   - Reduce `MAX_CHARS_PER_CHUNK` in `.env` (e.g. `1200`).
+   - Lower `OLLAMA_NUM_CTX` (e.g. `4096`).
+- **Docker networking issues (macOS):**
+   - Use `docker compose -f docker-compose.mac.yml` which routes Ollama via `host.docker.internal`.
+- **Out of memory:**
+   - Lower chunk size or use a smaller model.
+- **Port conflicts:**
+   - Change `APP_HOST_PORT` in `.env` and restart Docker Compose.
+- **Checker/model errors:**
+   - See sidebar for checker status and logs. Ensure the checker model is pulled.
+- **Dependency install issues:**
+   - Ensure Python 3.12+ and pip are installed. Use a clean virtual environment.
 
 ---
 
@@ -187,30 +299,47 @@ All checker calls go to the same local Ollama endpoint as translation. No text i
 
 ## Model Information
 
-### Default Model: Qwen2.5 7B
 
-| Property | Value |
-|----------|-------|
-| **License** | Apache 2.0 (commercial use allowed) |
-| **Size on disk** | ~4.7 GB |
-| **Languages** | English, Spanish, and many others |
-| **CPU speed** | 2–8 seconds per 200-word chunk |
-| **GPU speed** | 1–2 seconds per 200-word chunk |
+### Model Defaults by Docker Compose Profile
 
-### Optional Model: Qwen2.5 14B
+| Compose Profile         | Default Model   | Notes                                      |
+|------------------------|-----------------|---------------------------------------------|
+| `docker-compose.yml`   | `qwen2.5:3b`    | Best for CPU/low-memory systems             |
+| `docker-compose.gpu.yml` | `qwen2.5:7b`  | Best for GPU, higher quality/speed          |
+| `docker-compose.mac.yml` | `qwen2.5:7b`  | Best for Mac with local Ollama              |
 
-| Property | Value |
-|----------|-------|
-| **License** | Apache 2.0 |
-| **Size on disk** | ~9 GB |
-| **RAM required** | ~12 GB |
-| **Quality** | Higher quality than 7B; slower |
+**All profiles**: The 3B and 14B models are available as options in the UI. 14B requires more RAM.
+
+#### Qwen2.5 3B (CPU default)
+| Property         | Value                |
+|------------------|---------------------|
+| **License**      | Apache 2.0          |
+| **Size on disk** | ~2.5 GB             |
+| **RAM required** | ~4–6 GB             |
+| **Quality**      | Fastest, lowest RAM |
+
+#### Qwen2.5 7B (GPU/mac default)
+| Property         | Value                |
+|------------------|---------------------|
+| **License**      | Apache 2.0          |
+| **Size on disk** | ~4.7 GB             |
+| **RAM required** | ~8 GB               |
+| **Quality**      | Higher quality      |
+
+#### Qwen2.5 14B (optional)
+| Property         | Value                |
+|------------------|---------------------|
+| **License**      | Apache 2.0          |
+| **Size on disk** | ~9 GB               |
+| **RAM required** | ~12 GB              |
+| **Quality**      | Highest, slowest    |
 
 > Select between models in the **Ollama model** dropdown in the sidebar. No restart required.
 
+
 ### Changing the default model
 
-Edit `.env` and set `OLLAMA_MODEL`:
+Edit `.env` and set `OLLAMA_MODEL` to your preferred model (e.g. `qwen2.5:3b`, `qwen2.5:7b`, or `qwen2.5:14b`).
 
 ```env
 OLLAMA_MODEL=qwen2.5:7b
@@ -327,47 +456,7 @@ Then restart: `docker compose restart app`
 
 ## Troubleshooting
 
-### Ollama connection error
-```
-Could not reach Ollama at http://ollama:11434
-```
-1. Check containers are running: `docker compose ps`
-2. Check Ollama logs: `docker compose logs ollama`
-3. Wait for model pull: `docker compose logs ollama-pull`
-4. Restart: `docker compose restart`
 
-### Model pull timeout
-Pull manually:
-```bash
-docker exec spanish-reader-ollama ollama pull aya-expanse:8b
-```
-
-### Out of memory
-1. Reduce `MAX_CHARS_PER_CHUNK` in `.env` (default 2200)
-2. Reduce the "Chunks to process" slider in the sidebar
-3. Switch to a smaller model (e.g., `mistral:7b`)
-
-### Slow translation
-1. Lower the temperature slider in the sidebar
-2. Reduce chunk size
-3. Use GPU if available
-
-### Checker timeout
-- Increase `CHECKER_TIMEOUT_SECONDS` in `.env`
-- Switch to `fast` mode for deterministic-only checking
-- Set `CHECKER_MODE=off` to disable checking entirely
-
-### Checker model not found
-```
-Checker model 'xyz' not found.
-```
-Either set `CHECKER_MODEL=` (blank, to use the translation model) or pull the model:
-```bash
-docker exec spanish-reader-ollama ollama pull xyz
-```
-
-### Checker is unavailable / checker badge shows "unavailable"
-The checker fails open — your translation is always preserved. Check Ollama connectivity and model availability. The checker badge shows the reason.
 
 ---
 
@@ -392,84 +481,10 @@ The checker fails open — your translation is always preserved. Check Ollama co
 
 ---
 
+
 ## License
 
-This project is provided for educational and personal use.
-
-**The default model (Aya Expanse 8B) is released under CC-BY-NC.** Users are responsible for verifying model license compatibility with their use case.
-
-
-## Quick Start
-
-### Prerequisites
-
-- Docker and Docker Compose installed
-- 16 GB RAM recommended (8 GB minimum for `aya-expanse:8b` on CPU)
-- Optional: NVIDIA GPU with 8 GB+ VRAM for faster inference
-
-### Setup
-
-1. Clone the repository:
-   ```bash
-   git clone <repo-url>
-   cd spanish_translater
-   ```
-
-2. Create `.env` from `.env.example`:
-   ```bash
-   cp .env.example .env
-   ```
-
-3. Start with Docker Compose (CPU):
-   ```bash
-   docker compose up --build
-   ```
-
-   For GPU support:
-   ```bash
-   docker compose -f docker-compose.gpu.yml up --build
-   ```
-
-4. Open your browser:
-   ```
-   http://localhost:8502
-   ```
-
-> **First startup:** The `aya-expanse:8b` model (~5 GB) will be pulled automatically. This takes 5–10 minutes depending on your internet speed. Subsequent starts reuse the cached model.
-
----
-
-## Model Information
-
-### Default Model: Aya Expanse 8B
-
-| Property | Value |
-|----------|-------|
-| **License** | CC-BY-NC (non-commercial use only) |
-| **Size on disk** | ~5 GB |
-| **Languages** | English, Spanish, and 100+ others |
-| **CPU speed** | 2–10 seconds per 200-word chunk |
-| **GPU speed** | 1–3 seconds per 200-word chunk |
-
-> **Important:** Verify that your use case (personal study, educational, research) is compatible with the CC-BY-NC license before deploying this application commercially. [Learn more](https://huggingface.co/CohereForAI/aya-expanse-8b)
-
-### Changing the Model
-
-Edit `.env` and set `OLLAMA_MODEL`:
-
-```env
-OLLAMA_MODEL=qwen3:14b
-```
-
-Then restart:
-```bash
-docker compose down
-docker compose up
-```
-
----
-
-## Changing the App Port
+This project is provided for educational and personal use. The default models are Apache 2.0 licensed. Users are responsible for verifying model license compatibility with their use case.
 
 Default port is `8502`. To use a different port, edit `.env`:
 
@@ -552,11 +567,7 @@ Could not reach Ollama at http://ollama:11434
 3. Wait for model pull: `docker compose logs ollama-pull`
 4. Restart: `docker compose restart`
 
-### Model pull timeout
-Pull manually:
-```bash
-docker exec spanish-reader-ollama ollama pull aya-expanse:8b
-```
+
 
 ### Out of memory
 1. Reduce `MAX_CHARS_PER_CHUNK` in `.env` (default 2200)
@@ -584,5 +595,5 @@ docker exec spanish-reader-ollama ollama pull aya-expanse:8b
 
 This project is provided for educational and personal use.
 
-**The default model (Aya Expanse 8B) is released under CC-BY-NC.** Users are responsible for verifying model license compatibility with their use case.
+
 
