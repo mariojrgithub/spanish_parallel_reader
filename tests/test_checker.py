@@ -231,7 +231,7 @@ def test_llm_disabled_never_runs():
         assert not should_run_llm_checker(settings, risk_score=1.0, pair_index=0)
 
 
-def test_retry_translation_only_in_smart_or_strict_modes():
+def test_retry_translation_for_blocking_failures_in_fast_smart_and_strict_modes():
     failing_result = PairCheckResult(
         passed=False,
         severity="fail",
@@ -240,7 +240,7 @@ def test_retry_translation_only_in_smart_or_strict_modes():
     )
 
     assert not should_retry_translation(_settings(mode="off"), failing_result)
-    assert not should_retry_translation(_settings(mode="fast"), failing_result)
+    assert should_retry_translation(_settings(mode="fast"), failing_result)
     assert should_retry_translation(_settings(mode="smart"), failing_result)
     assert should_retry_translation(_settings(mode="strict"), failing_result)
 

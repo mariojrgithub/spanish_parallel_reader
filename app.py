@@ -171,6 +171,8 @@ class ReadingPair(BaseModel):
     # Runtime-only flags used by the UI to mark checker-applied fixes.
     corrected_by_checker: bool = Field(default=False, exclude=True)
     correction_note: str = Field(default="", exclude=True)
+    correction_reason: str = Field(default="", exclude=True)
+    original_spanish_before_correction: str = Field(default="", exclude=True)
 
     @field_validator("difficulty", mode="before")
     @classmethod
@@ -271,12 +273,14 @@ st.markdown(
     <style>
     .block-container {
         padding-top: 1.5rem;
-        padding-bottom: 3rem;
+        padding-bottom: 7rem;
     }
+
     .small-muted {
         font-size: 0.88rem;
         color: #6b7280;
     }
+
     /* Guarantee full passage text is always visible */
     .passage-text {
         line-height: 1.75;
@@ -285,10 +289,109 @@ st.markdown(
         overflow-wrap: break-word;
         margin: 0 0 0.25rem 0;
     }
+
+    /* Fixed progress bar shown during generation/checking/correction. */
+    .sticky-progress-wrap {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 999999;
+        padding: 0.6rem 1rem 0.75rem 1rem;
+        background: linear-gradient(
+            to top,
+            rgba(255, 255, 255, 0.98),
+            rgba(255, 255, 255, 0.88)
+        );
+        border-top: 1px solid rgba(148, 163, 184, 0.35);
+        box-shadow: 0 -8px 24px rgba(15, 23, 42, 0.08);
+        pointer-events: none;
+    }
+
+    .sticky-progress-card {
+        max-width: min(1100px, calc(100vw - 2rem));
+        margin: 0 auto;
+        padding: 0.5rem 0.75rem;
+        border-radius: 0.85rem;
+        background: rgba(248, 250, 252, 0.96);
+        border: 1px solid rgba(203, 213, 225, 0.8);
+        pointer-events: auto;
+    }
+
+    .sticky-progress-text {
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+        font-size: 0.88rem;
+        color: #334155;
+        margin-bottom: 0.35rem;
+    }
+
+    .sticky-progress-track {
+        height: 0.55rem;
+        border-radius: 999px;
+        background: #e2e8f0;
+        overflow: hidden;
+    }
+
+    .sticky-progress-fill {
+        height: 100%;
+        border-radius: 999px;
+        background: linear-gradient(90deg, #2563eb, #06b6d4);
+        transition: width 180ms ease;
+    }
+
+    /* Floating jump link for returning to the Study tabs. */
+    .floating-study-link {
+        position: fixed;
+        right: 1rem;
+        bottom: 5.6rem;
+        z-index: 999998;
+        padding: 0.55rem 0.8rem;
+        border-radius: 999px;
+        background: #0f172a;
+        color: #ffffff !important;
+        font-size: 0.86rem;
+        font-weight: 700;
+        text-decoration: none !important;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.25);
+    }
+
+    .floating-study-link:hover {
+        background: #1e293b;
+        color: #ffffff !important;
+        text-decoration: none !important;
+    }
+
+    #study-tabs {
+        scroll-margin-top: 1rem;
+    }
+
+    @media (max-width: 640px) {
+        .sticky-progress-wrap {
+            padding: 0.45rem 0.5rem 0.55rem 0.5rem;
+        }
+
+        .sticky-progress-card {
+            max-width: calc(100vw - 1rem);
+        }
+
+        .sticky-progress-text {
+            font-size: 0.78rem;
+        }
+
+        .floating-study-link {
+            right: 0.7rem;
+            bottom: 5.2rem;
+            font-size: 0.78rem;
+            padding: 0.45rem 0.65rem;
+        }
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
 
 st.title("📚 Spanish Parallel Reader")
 st.caption("Local-first Spanish study with Streamlit + Ollama")
@@ -322,6 +425,9 @@ if "_enrich_idx" not in st.session_state:
     # Set by the "⚡ Add enrichments" button; cleared after enrichment completes.
     st.session_state._enrich_idx = None
 
+if "_spanish_focus_idx" not in st.session_state:
+    st.session_state._spanish_focus_idx = 0
+
 
 # -----------------------------
 # Text helpers
@@ -352,6 +458,43 @@ def _elapsed_suffix(start_time: float) -> str:
 def _overall_progress(chunk_position: int, chunk_count: int, phase_fraction: float) -> float:
     return min(((chunk_position - 1) + phase_fraction) / max(chunk_count, 1), 1.0)
 
+class StickyProgress:
+    """Small fixed-position progress UI with a Streamlit-like .progress API."""
+
+    def __init__(self) -> None:
+        self._slot = st.empty()
+
+    def progress(self, value: float, text: str = "") -> None:
+        fraction = max(0.0, min(float(value), 1.0))
+        percent = int(round(fraction * 100))
+        safe_text = _html.escape(str(text or "Working…"))
+
+        self._slot.markdown(
+            f"""
+            <div class="sticky-progress-wrap" role="status" aria-live="polite">
+                <div class="sticky-progress-card">
+                    <div class="sticky-progress-text">
+                        <span>{safe_text}</span>
+                        <strong>{percent}%</strong>
+                    </div>
+                    <div
+                        class="sticky-progress-track"
+                        role="progressbar"
+                        aria-valuemin="0"
+                        aria-valuemax="100"
+                        aria-valuenow="{percent}"
+                        aria-label="Translation progress"
+                    >
+                        <div class="sticky-progress-fill" style="width: {percent}%;"></div>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    def empty(self) -> None:
+        self._slot.empty()
 
 @st.cache_data
 def split_into_chunks(text: str, max_chars: int) -> List[str]:
@@ -892,10 +1035,400 @@ def _render_check_badge(result: PairCheckResult) -> None:
         st.error(msg)
 
 
+def _maybe_render_tts_button(
+    text: str,
+    *,
+    lang: str,
+    show_audio_controls: bool,
+) -> None:
+    if show_audio_controls and text.strip():
+        render_tts_button(text, lang=lang)
+
+
+def flatten_pairs(results: List[TranslationResponse]) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    global_passage_idx = 0
+    for result_idx, result in enumerate(results):
+        for pair_idx, pair in enumerate(result.pairs):
+            global_passage_idx += 1
+            records.append(
+                {
+                    "result": result,
+                    "pair": pair,
+                    "result_idx": result_idx,
+                    "pair_idx": pair_idx,
+                    "global_passage_idx": global_passage_idx,
+                }
+            )
+    return records
+
+
+def count_corrections(results: List[TranslationResponse]) -> int:
+    return sum(
+        1
+        for result in results
+        for pair in result.pairs
+        if pair.corrected_by_checker
+    )
+
+
+def collect_checker_status(
+    results: List[TranslationResponse],
+    checker_results: dict,
+    pair_check_keys: dict[int, str],
+) -> dict[str, int]:
+    counts = {"pass": 0, "info": 0, "warning": 0, "fail": 0, "missing": 0}
+    for result in results:
+        for pair in result.pairs:
+            check_key = pair_check_keys.get(id(pair))
+            check_result = checker_results.get(check_key) if check_key else None
+            if check_result is None:
+                counts["missing"] += 1
+                continue
+            counts[check_result.severity if check_result.severity in counts else "info"] += 1
+    return counts
+
+
+def filter_pair_records(
+    records: list[dict[str, object]],
+    query: str,
+    corrected_only: bool,
+    difficulty_filter: list[str],
+) -> list[dict[str, object]]:
+    needle = query.strip().lower()
+    allowed_difficulties = set(difficulty_filter)
+    filtered: list[dict[str, object]] = []
+
+    for record in records:
+        pair = record["pair"]
+        if not all(
+            hasattr(pair, attr)
+            for attr in ("english", "spanish", "difficulty", "corrected_by_checker")
+        ):
+            continue
+
+        if corrected_only and not pair.corrected_by_checker:
+            continue
+        if allowed_difficulties and pair.difficulty not in allowed_difficulties:
+            continue
+        if needle:
+            haystacks = [pair.english.lower(), pair.spanish.lower()]
+            if not any(needle in haystack for haystack in haystacks):
+                continue
+        filtered.append(record)
+
+    return filtered
+
+
+def build_blocked_export_items(
+    results: List[TranslationResponse],
+    checker_results: dict,
+    pair_check_keys: dict[int, str],
+) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    global_passage_idx = 0
+
+    for result_idx, result in enumerate(results):
+        for pair_idx, pair in enumerate(result.pairs):
+            global_passage_idx += 1
+            check_key = pair_check_keys.get(id(pair))
+            check_result = checker_results.get(check_key) if check_key else None
+
+            if check_result is None:
+                items.append(
+                    {
+                        "location": (
+                            f"Passage {global_passage_idx} "
+                            f"(chunk {result_idx + 1}, item {pair_idx + 1})"
+                        ),
+                        "severity": "missing",
+                        "summary": "Checker result is missing.",
+                    }
+                )
+                continue
+
+            if check_result.passed:
+                continue
+
+            items.append(
+                {
+                    "location": (
+                        f"Passage {global_passage_idx} "
+                        f"(chunk {result_idx + 1}, item {pair_idx + 1})"
+                    ),
+                    "severity": check_result.severity,
+                    "summary": (
+                        check_result.user_facing_summary
+                        or check_result.recommended_action
+                        or "Checker reported an issue."
+                    ),
+                }
+            )
+
+    return items
+
+
+def build_bilingual_csv(results: List[TranslationResponse]) -> bytes:
+    rows = [
+        {
+            "English": pair.english,
+            "Spanish": pair.spanish,
+            "Difficulty": pair.difficulty,
+            "Corrected": "yes" if pair.corrected_by_checker else "no",
+            "Correction note": pair.correction_note,
+        }
+        for result in results
+        for pair in result.pairs
+    ]
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+
+
+def build_spanish_only_text(results: List[TranslationResponse]) -> bytes:
+    lines: list[str] = []
+    for result in results:
+        if result.title:
+            lines.append(result.title)
+        lines.extend(pair.spanish for pair in result.pairs)
+        lines.append("")
+    return "\n".join(lines).encode("utf-8")
+
+
+def build_anki_csv(results: List[TranslationResponse]) -> bytes:
+    rows = []
+    for result in results:
+        for pair in result.pairs:
+            notes = []
+            if pair.grammar_notes:
+                notes.append("Grammar: " + " | ".join(pair.grammar_notes))
+            if pair.vocabulary:
+                notes.append(
+                    "Vocabulary: "
+                    + " | ".join(
+                        f"{vocab.spanish} = {vocab.english}" for vocab in pair.vocabulary
+                    )
+                )
+            rows.append(
+                {
+                    "Front": pair.spanish,
+                    "Back": "\n\n".join(part for part in [pair.english, *notes] if part),
+                }
+            )
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+
+
+def render_study_status(
+    *,
+    total_pairs: int,
+    total_vocab: int,
+    total_corrections: int,
+    checker_counts: dict[str, int],
+    export_blocked: bool,
+    checker_active: bool,
+) -> None:
+    
+    if not checker_active:
+        checker_value = "Off"
+    elif checker_counts["fail"]:
+        checker_value = f"{checker_counts['fail']} blocked"
+    elif checker_counts["warning"]:
+        checker_value = f"{checker_counts['warning']} warnings"
+    elif total_pairs and checker_counts["missing"] == total_pairs:
+        checker_value = "Not checked"
+    elif checker_counts["missing"]:
+        checker_value = f"{checker_counts['missing']} unchecked"
+    elif checker_counts["info"]:
+        checker_value = f"{checker_counts['info']} notes"
+    else:
+        checker_value = "Passed"
+
+    with st.container(border=True):
+        cols = st.columns(5)
+        cols[0].metric("Passages", total_pairs)
+        cols[1].metric("Vocabulary", total_vocab)
+        cols[2].metric("Corrections", total_corrections)
+        cols[3].metric("Checker", checker_value)
+        cols[4].metric("Export", "Blocked" if export_blocked else "Ready")
+        st.caption(
+            "Lesson ready for study. Use filters in Parallel Reader, focus mode in Spanish First, or export once the checker status looks right."
+        )
+
+
+def _clear_reader_filters() -> None:
+    st.session_state.reader_search = ""
+    st.session_state.reader_corrected_only = False
+    st.session_state.reader_difficulty_filter = []
+
+
+def _render_pair_card(
+    pair: ReadingPair,
+    *,
+    checker_results: dict,
+    checker_settings,
+    include_literal: bool,
+    tts_lang: str,
+    show_audio_controls: bool,
+    passage_label: str = "",
+) -> None:
+    with st.container(border=True):
+        if passage_label:
+            st.caption(passage_label)
+
+        left, right = st.columns(2)
+
+        with left:
+            st.markdown("**English**")
+            st.markdown(
+                f'<p class="passage-text">{_html.escape(pair.english).replace(chr(10), "<br>")}</p>',
+                unsafe_allow_html=True,
+            )
+
+        with right:
+            st.markdown("**Español**")
+            st.markdown(
+                f'<p class="passage-text">{_html.escape(pair.spanish).replace(chr(10), "<br>")}</p>',
+                unsafe_allow_html=True,
+            )
+            if pair.corrected_by_checker:
+                note = pair.correction_note or "Updated after checker correction"
+                st.markdown(
+                    f'<span style="background:#dcfce7;color:#166534;'
+                    f'padding:2px 8px;border-radius:4px;'
+                    f'font-size:0.80rem;font-weight:700;margin-right:6px;">'
+                    f'Corrected</span>'
+                    f'<span class="small-muted">{_html.escape(note)}</span>',
+                    unsafe_allow_html=True,
+                )
+            st.markdown(
+                f'<span style="background:#e0f2fe;color:#0369a1;'
+                f'padding:2px 8px;border-radius:4px;'
+                f'font-size:0.82rem;font-weight:600;">'
+                f'{pair.difficulty}</span>',
+                unsafe_allow_html=True,
+            )
+            _maybe_render_tts_button(
+                pair.spanish,
+                lang=tts_lang,
+                show_audio_controls=show_audio_controls,
+            )
+
+        if include_literal and pair.literal_spanish:
+            with st.expander("Literal Spanish"):
+                st.write(pair.literal_spanish)
+
+        if pair.grammar_notes:
+            with st.expander("Grammar notes"):
+                st.markdown("\n".join(f"- {note}" for note in pair.grammar_notes))
+
+        if pair.comprehension_question_spanish:
+            with st.expander("Comprehension question"):
+                st.write(pair.comprehension_question_spanish)
+
+        if checker_settings.enabled and checker_settings.mode != "off":
+            check_key = make_check_key(
+                checker_settings,
+                pair.english,
+                pair.spanish,
+                pair.literal_spanish,
+            )
+            check_result = checker_results.get(check_key)
+            if check_result is not None:
+                _render_checker_details(
+                    check_result,
+                    checker_settings.detailed_diagnostics,
+                    tts_lang,
+                    show_audio_controls,
+                )
+
+
+
+def _norm_pair_key(text: str) -> str:
+    """Normalize text for matching generated/enriched pairs by source English."""
+    return " ".join((text or "").split()).strip().casefold()
+
+
+def _preserve_checker_corrections(
+    existing_result: TranslationResponse,
+    enriched_result: TranslationResponse,
+) -> TranslationResponse:
+    corrected_by_english: dict[str, ReadingPair] = {}
+
+    for old_pair in existing_result.pairs:
+        if not old_pair.corrected_by_checker:
+            continue
+
+        key = _norm_pair_key(old_pair.english)
+        if key and key not in corrected_by_english:
+            corrected_by_english[key] = old_pair
+
+    for new_pair in enriched_result.pairs:
+        old_pair = corrected_by_english.get(_norm_pair_key(new_pair.english))
+        if old_pair is None:
+            continue
+
+        new_pair.spanish = old_pair.spanish
+        new_pair.corrected_by_checker = True
+        new_pair.correction_note = old_pair.correction_note
+        new_pair.correction_reason = old_pair.correction_reason
+        new_pair.original_spanish_before_correction = (
+            old_pair.original_spanish_before_correction
+        )
+
+    return enriched_result
+
+def _render_corrections_tab(
+    records: list[dict[str, object]],
+    *,
+    checker_results: dict,
+    pair_check_keys: dict[int, str],
+) -> None:
+    corrected_records = [
+        record
+        for record in records
+        if all(
+            hasattr(record["pair"], attr)
+            for attr in (
+                "english",
+                "spanish",
+                "corrected_by_checker",
+                "correction_note",
+                "original_spanish_before_correction",
+            )
+        )
+        and record["pair"].corrected_by_checker
+    ]
+    if not corrected_records:
+        st.info("No checker corrections were applied to this lesson.")
+        return
+
+    for record in corrected_records:
+        pair = record["pair"]
+        passage_idx = int(record["global_passage_idx"])
+        check_key = pair_check_keys.get(id(pair))
+        check_result = checker_results.get(check_key) if check_key else None
+
+        with st.container(border=True):
+            st.markdown(f"**Passage {passage_idx}**")
+            st.markdown("**English**")
+            st.write(pair.english)
+            if pair.original_spanish_before_correction:
+                st.markdown("**Before correction**")
+                st.write(pair.original_spanish_before_correction)
+            st.markdown("**Corrected Spanish**")
+            st.write(pair.spanish)
+            st.caption(pair.correction_note or "Applied checker correction")
+            
+            if getattr(pair, "correction_reason", ""):
+                st.caption(f"Reason: {pair.correction_reason}")
+            
+            if check_result is not None and check_result.user_facing_summary:
+                st.caption(f"Checker: {check_result.user_facing_summary}")
+
+
 def _render_checker_details(
     result: PairCheckResult,
     detailed: bool,
     tts_lang: str,
+    show_audio_controls: bool,
 ) -> None:
     """Render badge + expandable per-issue details for one pair."""
     _render_check_badge(result)
@@ -930,7 +1463,11 @@ def _render_checker_details(
         if result.corrected_spanish:
             st.markdown("**Corrected translation:**")
             st.info(result.corrected_spanish)
-            render_tts_button(result.corrected_spanish, lang=tts_lang)
+            _maybe_render_tts_button(
+                result.corrected_spanish,
+                lang=tts_lang,
+                show_audio_controls=show_audio_controls,
+            )
 
         if detailed:
             method = "LLM + deterministic" if result.checked_with_llm else "deterministic only"
@@ -951,9 +1488,10 @@ def render_result_card(
     result: "TranslationResponse",
     *,
     checker_results: dict,
-    checker_settings: "CheckerSettings",
+    checker_settings,
     include_literal: bool,
     tts_lang: str,
+    show_audio_controls: bool = True,
     result_idx: "int | None" = None,
 ) -> None:
     """Render one TranslationResponse as a parallel-reader card.
@@ -975,72 +1513,22 @@ def render_result_card(
             if result.summary_spanish:
                 st.markdown("**Spanish summary**")
                 st.write(result.summary_spanish)
-                render_tts_button(result.summary_spanish, lang=tts_lang)
-
-    for pair in result.pairs:
-        with st.container(border=True):
-            left, right = st.columns(2)
-
-            with left:
-                st.markdown("**English**")
-                st.markdown(
-                    f'<p class="passage-text">{_html.escape(pair.english).replace(chr(10), "<br>")}</p>',
-                    unsafe_allow_html=True,
+                _maybe_render_tts_button(
+                    result.summary_spanish,
+                    lang=tts_lang,
+                    show_audio_controls=show_audio_controls,
                 )
 
-            with right:
-                st.markdown("**Español**")
-                st.markdown(
-                    f'<p class="passage-text">{_html.escape(pair.spanish).replace(chr(10), "<br>")}</p>',
-                    unsafe_allow_html=True,
-                )
-                if pair.corrected_by_checker:
-                    _note = pair.correction_note or "Updated after checker correction"
-                    st.markdown(
-                        f'<span style="background:#dcfce7;color:#166534;'
-                        f'padding:2px 8px;border-radius:4px;'
-                        f'font-size:0.80rem;font-weight:700;margin-right:6px;">'
-                        f'Corrected</span>'
-                        f'<span class="small-muted">{_html.escape(_note)}</span>',
-                        unsafe_allow_html=True,
-                    )
-                st.markdown(
-                    f'<span style="background:#e0f2fe;color:#0369a1;'
-                    f'padding:2px 8px;border-radius:4px;'
-                    f'font-size:0.82rem;font-weight:600;">'
-                    f'{pair.difficulty}</span>',
-                    unsafe_allow_html=True,
-                )
-                render_tts_button(pair.spanish, lang=tts_lang)
-
-            if include_literal and pair.literal_spanish:
-                with st.expander("Literal Spanish"):
-                    st.write(pair.literal_spanish)
-
-            if pair.grammar_notes:
-                with st.expander("Grammar notes"):
-                    st.markdown(
-                        "\n".join(f"- {note}" for note in pair.grammar_notes)
-                    )
-
-            if pair.comprehension_question_spanish:
-                with st.expander("Comprehension question"):
-                    st.write(pair.comprehension_question_spanish)
-
-            if checker_settings.enabled and checker_settings.mode != "off":
-                _ck = make_check_key(
-                    checker_settings,
-                    pair.english,
-                    pair.spanish,
-                    pair.literal_spanish,
-                )
-                _cr = checker_results.get(_ck)
-                if _cr is not None:
-                    _render_checker_details(
-                        _cr,
-                        checker_settings.detailed_diagnostics,
-                        tts_lang,
-                    )
+    for pair_idx, pair in enumerate(result.pairs, start=1):
+        _render_pair_card(
+            pair,
+            checker_results=checker_results,
+            checker_settings=checker_settings,
+            include_literal=include_literal,
+            tts_lang=tts_lang,
+            show_audio_controls=show_audio_controls,
+            passage_label=f"Passage {pair_idx} / {len(result.pairs)}",
+        )
 
     # ── On-demand enrichment button ───────────────────────────────────────────
     # Shown in the Study tab when the chunk was translated without enrichments.
@@ -1066,52 +1554,74 @@ def render_result_card(
 with st.sidebar:
     st.header("Settings")
 
-    st.write("**Model**")
+    settings_mode = st.radio(
+        "Settings mode",
+        ["Simple", "Advanced"],
+        horizontal=True,
+        help="Simple keeps learner-friendly controls visible. Advanced shows model tuning and checker internals.",
+    )
+    _advanced_mode = settings_mode == "Advanced"
+
     _default_idx = (
         AVAILABLE_OLLAMA_MODELS.index(OLLAMA_MODEL)
         if OLLAMA_MODEL in AVAILABLE_OLLAMA_MODELS
         else 0
     )
-    selected_model = st.selectbox(
-        "Ollama model",
-        AVAILABLE_OLLAMA_MODELS,
-        index=_default_idx,
-        help="qwen2.5:3b is fastest on CPU. qwen2.5:7b is the default. qwen2.5:14b is highest quality.",
-    )
+
+    if _advanced_mode:
+        st.write("**Model**")
+        selected_model = st.selectbox(
+            "Ollama model",
+            AVAILABLE_OLLAMA_MODELS,
+            index=_default_idx,
+            help="qwen2.5:3b is fastest on CPU. qwen2.5:7b is the default. qwen2.5:14b is highest quality.",
+        )
+    else:
+        selected_model = (
+            OLLAMA_MODEL
+            if OLLAMA_MODEL in AVAILABLE_OLLAMA_MODELS
+            else AVAILABLE_OLLAMA_MODELS[_default_idx]
+        )
 
     _check_started = time.monotonic()
     ok, status = check_ollama(selected_model)
     status = f"{status} (checked{_elapsed_suffix(_check_started)})"
 
     if ok:
-        st.success(status)
+        if _advanced_mode:
+            st.success(status)
+        else:
+            st.caption("Model ready")
         warmup_model(selected_model)
     else:
         st.warning(status)
 
-    with st.expander("Model guidance"):
-        st.markdown(
-            """
-Default: `qwen2.5:7b` — fast, low memory, good Spanish quality.
+    
+    if _advanced_mode:
+        with st.expander("Model guidance"):
 
-CPU-only: `qwen2.5:3b` — ~2× faster than 7b on CPU; modest quality reduction.
+            st.markdown(
+                """
+    Default: `qwen2.5:7b` — fast, low memory, good Spanish quality.
 
-Optional: `qwen2.5:14b` — higher quality, requires ~12 GB RAM / 10 GB+ VRAM.
+    CPU-only: `qwen2.5:3b` — ~2× faster than 7b on CPU; modest quality reduction.
 
-To change the default, set `OLLAMA_MODEL` in `.env` and restart containers.
+    Optional: `qwen2.5:14b` — higher quality, requires ~12 GB RAM / 10 GB+ VRAM.
 
-Pull models before starting:
-```
-ollama pull qwen2.5:3b
-ollama pull qwen2.5:7b
-ollama pull qwen2.5:14b
-```
+    To change the default, set `OLLAMA_MODEL` in `.env` and restart containers.
 
-⚠️ **Hardware:** `qwen2.5:3b` ~3–4 GB RAM · `qwen2.5:7b` ~6–8 GB RAM · `qwen2.5:14b` ~12 GB RAM.
+    Pull models before starting:
+    ```
+    ollama pull qwen2.5:3b
+    ollama pull qwen2.5:7b
+    ollama pull qwen2.5:14b
+    ```
 
-🔒 **License:** Qwen2.5 is released under Apache 2.0 (commercial use allowed).
-"""
-        )
+    ⚠️ **Hardware:** `qwen2.5:3b` ~3–4 GB RAM · `qwen2.5:7b` ~6–8 GB RAM · `qwen2.5:14b` ~12 GB RAM.
+
+    🔒 **License:** Qwen2.5 is released under Apache 2.0 (commercial use allowed).
+    """
+            )
 
     input_mode = st.radio(
         "Input type",
@@ -1167,13 +1677,16 @@ ollama pull qwen2.5:14b
         index=0,
     )
 
-    max_chars = st.slider(
-        "Max characters per chunk",
-        800,
-        4000,
-        DEFAULT_MAX_CHARS,
-        step=100,
-    )
+    if _advanced_mode:
+        max_chars = st.slider(
+            "Max characters per chunk",
+            800,
+            4000,
+            DEFAULT_MAX_CHARS,
+            step=100,
+        )
+    else:
+        max_chars = DEFAULT_MAX_CHARS
 
     chunks_to_process = st.slider(
         "Chunks to process",
@@ -1182,13 +1695,22 @@ ollama pull qwen2.5:14b
         2,
     )
 
-    temperature = st.slider(
-        "Model temperature",
-        0.0,
-        0.3,
-        OLLAMA_TEMPERATURE,
-        step=0.05,
-        help="Lower = more consistent JSON output. Keep below 0.3 for reliable structured translation.",
+    if _advanced_mode:
+        temperature = st.slider(
+            "Model temperature",
+            0.0,
+            0.3,
+            OLLAMA_TEMPERATURE,
+            step=0.05,
+            help="Lower = more consistent JSON output. Keep below 0.3 for reliable structured translation.",
+        )
+    else:
+        temperature = OLLAMA_TEMPERATURE
+
+    show_audio_controls = st.checkbox(
+        "Show audio controls",
+        value=True,
+        help="Hide play buttons if you want a cleaner reading view.",
     )
 
     _env_include_enrichments = os.getenv(
@@ -1256,42 +1778,59 @@ ollama pull qwen2.5:14b
             help=(
                 "instant: translate and show immediately, no checker.\n"
                 "off: no checks.\n"
-                "fast: show first, then deterministic checks only (no extra model calls).\n"
+                "fast: show first, run deterministic checks, and only use the model again for severe failures.\n"
                 "smart: show first, then deterministic + LLM for risky pairs.\n"
                 "strict: deterministic + LLM + retry before showing result."
             ),
-        )
-        checker_model_ui = st.text_input(
-            "Checker model",
-            value="",
-            placeholder="defaults to translation model",
-            help="Leave blank to use the same model as translation. Set CHECKER_MODEL in .env to make it persistent.",
         )
         checker_require_pass_ui = st.checkbox(
             "Require checker pass before export",
             value=_env_checker_require_pass,
             help="Block Markdown export for pairs that fail the checker.",
         )
-        checker_llm_ui = st.checkbox(
-            "LLM checker enabled",
-            value=_env_checker_llm,
-            help="Uncheck to use deterministic checks only (no additional model calls).",
-        )
-        checker_detailed_ui = st.checkbox(
-            "Show detailed diagnostics",
-            value=_env_checker_detailed,
-            help="Show per-issue breakdown. Keep off for a faster, cleaner UI.",
-        )
+        checker_model_ui = ""
+        checker_llm_ui = _env_checker_llm
+        checker_detailed_ui = _env_checker_detailed
+        if _advanced_mode:
+            checker_model_ui = st.text_input(
+                "Checker model",
+                value="",
+                placeholder="defaults to translation model",
+                help="Leave blank to use the same model as translation. Set CHECKER_MODEL in .env to make it persistent.",
+            )
+            checker_llm_ui = st.checkbox(
+                "LLM checker enabled",
+                value=_env_checker_llm,
+                help="Uncheck to use deterministic checks only (no additional model calls).",
+            )
+            checker_detailed_ui = st.checkbox(
+                "Show detailed diagnostics",
+                value=_env_checker_detailed,
+                help="Show per-issue breakdown. Keep off for a faster, cleaner UI.",
+            )
 
     if st.button("Clear session"):
         set_source_text("")
         st.session_state.checker_results = {}
         st.session_state._translation_cache.clear()
+        
         st.session_state._cached_markdown_key = None
         st.session_state._cached_markdown = None
+        st.session_state.pop("_cached_extra_exports_key", None)
+        st.session_state.pop("_cached_bilingual_csv", None)
+        st.session_state.pop("_cached_spanish_text", None)
+        st.session_state.pop("_cached_anki_csv", None)
+        st.session_state._enrich_idx = None
+        st.session_state._spanish_focus_idx = 0
+
+        # Reset Study UI controls.
+        st.session_state.reader_search = ""
+        st.session_state.reader_corrected_only = False
+        st.session_state.reader_difficulty_filter = []
+        st.session_state.pop("spanish_first_mode", None)
+
         st.session_state.pop("_last_upload_key", None)
         st.rerun()
-
 
 # -----------------------------
 # Checker settings (resolved from sidebar + env)
@@ -1476,7 +2015,8 @@ if _translate_clicked:
     failed_chunks = []
     _n_chunks = len(selected_chunks)
     _workflow_started = time.monotonic()
-    _progress_bar = st.progress(0, text="Preparing translation workflow…")
+    _progress_bar = StickyProgress()
+    _progress_bar.progress(0, text="Preparing translation workflow…")
 
     for idx, chunk in enumerate(selected_chunks, start=start + 1):
         _ci = idx - start  # 1-based position within the selected range
@@ -1584,8 +2124,11 @@ if _translate_clicked:
         _checker_changed_translation = False
         _run_checker = result is not None and _eff_mode not in ("off", "instant")
 
-        # ── Render immediately for instant / fast / smart ────────────────────
-        if result is not None and not _is_strict:
+        
+        # ── Render immediately only when no checker/correction pass will run ──
+        # If checker is active, wait until after checker + retry/correction so
+        # the side-by-side Spanish block always reflects the final corrected text.
+        if result is not None and not _run_checker:
             st.markdown(
                 f'<span class="small-muted">✓ Chunk {idx} of {len(selected_chunks)} translated</span>',
                 unsafe_allow_html=True,
@@ -1596,7 +2139,9 @@ if _translate_clicked:
                 checker_settings=checker_settings,
                 include_literal=include_literal,
                 tts_lang=tts_lang,
+                show_audio_controls=show_audio_controls,
             )
+
 
         if _run_checker:
             # fast mode is deterministic-only (no GPU calls): use det_workers.
@@ -1758,6 +2303,13 @@ if _translate_clicked:
                                     if _used_checker_correction
                                     else "Updated after checker retry"
                                 )
+                                _new_pair.original_spanish_before_correction = _original_spanish
+                                
+                                _new_pair.correction_reason = (
+                                    _cr.user_facing_summary
+                                    or _cr.recommended_action
+                                    or ""
+                                )
 
                             if _changed_spanish and not _blocking_unresolved:
                                 _retry_success += 1
@@ -1801,10 +2353,13 @@ if _translate_clicked:
                     text=f"Chunk {_ci} of {_n_chunks}: no corrections needed",
                 )
 
-        # ── Render in strict mode (after checker + retry) ────────────────────
-        if result is not None and _is_strict:
+        
+        # ── Render checked modes after checker + retry/correction ─────────────
+        # column uses result.pairs after any checker-applied        # This covers fast, smart, and strict. Rendering here ensures the
+        # correction or retranslation.
+        if result is not None and _run_checker:
             st.markdown(
-                f'<span class="small-muted">\u2713 Chunk {idx} of {len(selected_chunks)} translated</span>',
+                f'<span class="small-muted">✓ Chunk {idx} of {len(selected_chunks)} checked</span>',
                 unsafe_allow_html=True,
             )
             render_result_card(
@@ -1813,6 +2368,7 @@ if _translate_clicked:
                 checker_settings=checker_settings,
                 include_literal=include_literal,
                 tts_lang=tts_lang,
+                show_audio_controls=show_audio_controls,
             )
 
         _progress_bar.progress(
@@ -1872,7 +2428,39 @@ if (
                     temperature=temperature,
                     model=selected_model,
                 )
-                st.session_state.results[_eidx] = _enriched
+                
+                _merged_enriched = _preserve_checker_corrections(
+                    _eresult,
+                    _enriched,
+                )
+
+                # Remove stale checker results for the pre-enrichment pairs.
+                if checker_settings.enabled and checker_settings.mode not in ("off", "instant"):
+                    for _old_pair in _eresult.pairs:
+                        _old_ck = make_check_key(
+                            checker_settings,
+                            _old_pair.english,
+                            _old_pair.spanish,
+                            _old_pair.literal_spanish,
+                        )
+                        st.session_state.checker_results.pop(_old_ck, None)
+
+                    # Recheck enriched pairs so Study metrics/export readiness stay accurate.
+                    for _pidx, _pair in enumerate(_merged_enriched.pairs):
+                        _new_ck, _new_cr = check_pair(
+                            settings=checker_settings,
+                            english=_pair.english,
+                            spanish=_pair.spanish,
+                            literal_spanish=_pair.literal_spanish,
+                            pair_index=_pidx,
+                            cached_results={},
+                        )
+                        st.session_state.checker_results[_new_ck] = _new_cr
+
+                st.session_state.results[_eidx] = _merged_enriched
+                st.session_state._cached_markdown_key = None
+                st.session_state._cached_markdown = None
+
             except Exception as _enrich_exc:
                 st.error(f"Enrichment failed: {_enrich_exc}")
             else:
@@ -1889,12 +2477,14 @@ if (
 if st.session_state.results and not _translate_clicked:
     st.subheader("3. Study")
 
+    _flat_records = flatten_pairs(st.session_state.results)
     _total_pairs = sum(len(r.pairs) for r in st.session_state.results)
     _total_vocab = sum(
         len(p.vocabulary)
         for r in st.session_state.results
         for p in r.pairs
     )
+    _total_corrections = count_corrections(st.session_state.results)
 
     # Pre-compute checker keys once per render; reused in tab_reader, tab_export,
     # and the export-blocked check — avoids redundant json.dumps + SHA-256 calls.
@@ -1909,47 +2499,233 @@ if st.session_state.results and not _translate_clicked:
                     _p.literal_spanish,
                 )
 
+    _checker_counts = collect_checker_status(
+        st.session_state.results,
+        st.session_state.checker_results,
+        _pair_check_keys,
+    )
+    _blocked_export_items = build_blocked_export_items(
+        st.session_state.results,
+        st.session_state.checker_results,
+        _pair_check_keys,
+    )
+
     
+
+
+    _checker_required_for_export = (
+        checker_settings.require_pass
+        and checker_settings.enabled
+        and checker_settings.mode not in ("off", "instant")
+    )
+
+    _export_blocked = _checker_required_for_export and bool(_blocked_export_items)
+
+
+
+    render_study_status(
+        total_pairs=_total_pairs,
+        total_vocab=_total_vocab,
+        total_corrections=_total_corrections,
+        checker_counts=_checker_counts,
+        export_blocked=_export_blocked,
+        checker_active=checker_settings.enabled and checker_settings.mode not in ("off", "instant"),
+    )
+
+    
+    st.markdown('<div id="study-tabs"></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<a class="floating-study-link" href="#study-tabs" title="Jump back to Study tabs">↥ Study tabs</a>',
+        unsafe_allow_html=True,
+    )
+
     _tab_labels = [
         f"📖 Parallel Reader ({_total_pairs})",
         f"🇪🇸 Spanish First ({_total_pairs})",
         f"🧠 Vocabulary ({_total_vocab})",
-        "⬇️ Export",
     ]
+    if _total_corrections:
+        _tab_labels.append(f"🩹 Corrections ({_total_corrections})")
+    _tab_labels.append("⬇️ Export")
 
-    tab_reader, tab_spanish, tab_vocab, tab_export = st.tabs(_tab_labels)
+    _tabs = st.tabs(_tab_labels)
+    tab_reader = _tabs[0]
+    tab_spanish = _tabs[1]
+    tab_vocab = _tabs[2]
+    tab_corrections = _tabs[3] if _total_corrections else None
+    tab_export = _tabs[-1]
 
     with tab_reader:
-        for _ridx, result in enumerate(st.session_state.results):
-            render_result_card(
-                result,
-                checker_results=st.session_state.checker_results,
-                checker_settings=checker_settings,
-                include_literal=include_literal,
-                tts_lang=tts_lang,
-                result_idx=_ridx,
+        _filter_cols = st.columns([2.4, 1, 1.2, 0.8])
+        with _filter_cols[0]:
+            _reader_search = st.text_input(
+                "Search passages",
+                key="reader_search",
+                placeholder="Search English or Spanish text",
             )
+        with _filter_cols[1]:
+            _reader_corrected_only = st.checkbox(
+                "Corrected only",
+                key="reader_corrected_only",
+            )
+        with _filter_cols[2]:
+            _reader_difficulty = st.multiselect(
+                "Difficulty",
+                list(_VALID_DIFFICULTIES),
+                key="reader_difficulty_filter",
+            )
+        with _filter_cols[3]:
+            st.write("")
+            st.button("Clear", key="reader_clear_filters", on_click=_clear_reader_filters)
+
+        _filtered_records = filter_pair_records(
+            _flat_records,
+            _reader_search,
+            _reader_corrected_only,
+            _reader_difficulty,
+        )
+        if len(_filtered_records) != len(_flat_records):
+            st.caption(f"Showing {len(_filtered_records)} of {_total_pairs} passages.")
+
+        if not _filtered_records:
+            st.info("No passages matched the current filters.")
+        elif not (_reader_search or _reader_corrected_only or _reader_difficulty):
+            for _ridx, result in enumerate(st.session_state.results):
+                render_result_card(
+                    result,
+                    checker_results=st.session_state.checker_results,
+                    checker_settings=checker_settings,
+                    include_literal=include_literal,
+                    tts_lang=tts_lang,
+                    show_audio_controls=show_audio_controls,
+                    result_idx=_ridx,
+                )
+        else:
+            _last_result_idx = None
+            for record in _filtered_records:
+                _result = record["result"]
+                _pair = record["pair"]
+                _result_idx = int(record["result_idx"])
+                _pair_idx = int(record["pair_idx"])
+                _global_passage_idx = int(record["global_passage_idx"])
+                if not all(
+                    hasattr(_pair, attr)
+                    for attr in (
+                        "english",
+                        "spanish",
+                        "literal_spanish",
+                        "difficulty",
+                        "corrected_by_checker",
+                        "correction_note",
+                        "grammar_notes",
+                        "comprehension_question_spanish",
+                    )
+                ):
+                    continue
+                _result_title = getattr(_result, "title", "")
+                if _result_idx != _last_result_idx and _result_title:
+                    st.markdown(f"### {_result_title}")
+                _render_pair_card(
+                    _pair,
+                    checker_results=st.session_state.checker_results,
+                    checker_settings=checker_settings,
+                    include_literal=include_literal,
+                    tts_lang=tts_lang,
+                    show_audio_controls=show_audio_controls,
+                    passage_label=(
+                        f"Passage {_global_passage_idx} "
+                        f"(chunk {_result_idx + 1}, item {_pair_idx + 1})"
+                    ),
+                )
+                _last_result_idx = _result_idx
 
     with tab_spanish:
         st.caption(
             "Read Spanish first, then reveal English when you need it."
         )
+        _spanish_mode = st.radio(
+            "Study mode",
+            ["Full list", "Focus mode"],
+            horizontal=True,
+            key="spanish_first_mode",
+        )
 
-        for result in st.session_state.results:
-            if result.title:
-                st.markdown(f"### {result.title}")
-            for i, pair in enumerate(result.pairs, start=1):
-                st.markdown(
-                    f"**Passage {i} / {len(result.pairs)}**",
+        if _spanish_mode == "Focus mode" and _flat_records:
+            st.session_state._spanish_focus_idx = min(
+                st.session_state._spanish_focus_idx,
+                len(_flat_records) - 1,
+            )
+            _focus_record = _flat_records[st.session_state._spanish_focus_idx]
+            _focus_result = _focus_record["result"]
+            _focus_pair = _focus_record["pair"]
+            _focus_global_idx = int(_focus_record["global_passage_idx"])
+
+            if not all(
+                hasattr(_focus_pair, attr)
+                for attr in (
+                    "english",
+                    "spanish",
+                    "corrected_by_checker",
+                    "correction_note",
                 )
-                st.write(pair.spanish)
-                if pair.corrected_by_checker:
-                    _note = pair.correction_note or "Updated after checker correction"
-                    st.caption(f"✅ Corrected by checker: {_note}")
-                render_tts_button(pair.spanish, lang=tts_lang)
+            ):
+                st.warning("Focus mode could not load the selected passage. Try Full list mode.")
+            else:
+                _nav_cols = st.columns([1, 1.2, 1])
+                with _nav_cols[0]:
+                    if st.button(
+                        "Previous",
+                        key="spanish_focus_prev",
+                        disabled=st.session_state._spanish_focus_idx <= 0,
+                    ):
+                        st.session_state._spanish_focus_idx -= 1
+                        st.rerun()
+                with _nav_cols[1]:
+                    st.caption(f"Passage {_focus_global_idx} of {_total_pairs}")
+                with _nav_cols[2]:
+                    if st.button(
+                        "Next",
+                        key="spanish_focus_next",
+                        disabled=st.session_state._spanish_focus_idx >= len(_flat_records) - 1,
+                    ):
+                        st.session_state._spanish_focus_idx += 1
+                        st.rerun()
 
-                with st.expander("Reveal English"):
-                    st.write(pair.english)
+                _focus_title = getattr(_focus_result, "title", "")
+                if _focus_title:
+                    st.markdown(f"### {_focus_title}")
+                with st.container(border=True):
+                    st.write(_focus_pair.spanish)
+                    if _focus_pair.corrected_by_checker:
+                        _note = _focus_pair.correction_note or "Updated after checker correction"
+                        st.caption(f"✅ Corrected by checker: {_note}")
+                    _maybe_render_tts_button(
+                        _focus_pair.spanish,
+                        lang=tts_lang,
+                        show_audio_controls=show_audio_controls,
+                    )
+                    with st.expander("Reveal English"):
+                        st.write(_focus_pair.english)
+        else:
+            for result in st.session_state.results:
+                if result.title:
+                    st.markdown(f"### {result.title}")
+                for i, pair in enumerate(result.pairs, start=1):
+                    st.markdown(
+                        f"**Passage {i} / {len(result.pairs)}**",
+                    )
+                    st.write(pair.spanish)
+                    if pair.corrected_by_checker:
+                        _note = pair.correction_note or "Updated after checker correction"
+                        st.caption(f"✅ Corrected by checker: {_note}")
+                    _maybe_render_tts_button(
+                        pair.spanish,
+                        lang=tts_lang,
+                        show_audio_controls=show_audio_controls,
+                    )
+
+                    with st.expander("Reveal English"):
+                        st.write(pair.english)
 
     with tab_vocab:
         rows = [
@@ -1986,6 +2762,14 @@ if st.session_state.results and not _translate_clicked:
                 "the Parallel Reader tab to add vocabulary."
             )
 
+    if tab_corrections is not None:
+        with tab_corrections:
+            _render_corrections_tab(
+                _flat_records,
+                checker_results=st.session_state.checker_results,
+                pair_check_keys=_pair_check_keys,
+            )
+
     with tab_export:
         # Cache the markdown string; rebuild only when results or checker data change.
         
@@ -2000,6 +2784,7 @@ if st.session_state.results and not _translate_clicked:
                     pair.comprehension_question_spanish,
                     pair.corrected_by_checker,
                     pair.correction_note,
+                    pair.correction_reason,
                 )
                 for result in st.session_state.results
                 for pair in result.pairs
@@ -2085,24 +2870,29 @@ if st.session_state.results and not _translate_clicked:
 
             st.session_state._cached_markdown = "\n".join(markdown)
             st.session_state._cached_markdown_key = _mk_cache_key
-
-        # Determine if export should be blocked
-        _export_blocked = checker_settings.require_pass and any(
-            not st.session_state.checker_results.get(
-                _pair_check_keys.get(id(pair)),
-                PairCheckResult(),
-            ).passed
-            for result in st.session_state.results
-            for pair in result.pairs
-        )
+            
+        if st.session_state.get("_cached_extra_exports_key") != _mk_cache_key:
+            st.session_state._cached_bilingual_csv = build_bilingual_csv(st.session_state.results)
+            st.session_state._cached_spanish_text = build_spanish_only_text(st.session_state.results)
+            st.session_state._cached_anki_csv = build_anki_csv(st.session_state.results)
+            st.session_state._cached_extra_exports_key = _mk_cache_key
 
         if _export_blocked:
+            
             st.error(
-                "Export blocked: one or more pairs did not pass the checker. "
-                "Review the checker warnings in the Parallel Reader tab, or "
-                "disable 'Require checker pass before export' in the sidebar."
-            )
+                    "Export blocked: one or more pairs did not pass the checker. "
+                    "Review the checker warnings in the Parallel Reader tab, or "
+                    "disable 'Require checker pass before export' in the sidebar."
+                )
+
+            with st.expander("Blocked passages", expanded=True):
+                for item in _blocked_export_items:
+                    st.markdown(
+                        f"- **{item['location']}** — {item['severity']} — {item['summary']}"
+                    )
+
             st.info("You can still view all translations in the Reader tabs above.")
+
         else:
             st.download_button(
                 "Download study notes Markdown",
@@ -2110,6 +2900,33 @@ if st.session_state.results and not _translate_clicked:
                 "spanish_parallel_reader.md",
                 "text/markdown",
             )
+
+            _export_cols = st.columns(3)
+
+            with _export_cols[0]:
+                st.download_button(
+                    "Download bilingual CSV",
+                    st.session_state._cached_bilingual_csv,
+                    "spanish_parallel_reader_bilingual.csv",
+                    "text/csv",
+                )
+
+            with _export_cols[1]:
+                st.download_button(
+                    "Download Spanish text",
+                    st.session_state._cached_spanish_text,
+                    "spanish_parallel_reader_es.txt",
+                    "text/plain",
+                )
+
+            with _export_cols[2]:
+                st.download_button(
+                    "Download Anki CSV",
+                    st.session_state._cached_anki_csv,
+                    "spanish_parallel_reader_anki.csv",
+                    "text/csv",
+                )
+
 
 else:
     st.info("Add text and translate a chunk to see the study interface.")
