@@ -121,6 +121,32 @@ class TestTranslateChunkSuccess:
         import app as _app
         assert _app.AVAILABLE_OLLAMA_MODELS[0] == "qwen2.5:7b"
 
+    def test_recovers_spanished_typo_without_dropping_pair(self):
+        """Model typo 'spanished' should be normalized to 'spanish'."""
+        data = {
+            "title": "Test",
+            "summary_english": "A short English summary.",
+            "summary_spanish": "Un breve resumen en español.",
+            "pairs": [
+                {
+                    "english": "She recommends reframing it as a difference in opinion.",
+                    "spanished": "Recomienda replantearlo como una diferencia de opinión.",
+                    "literal_spanish": "",
+                    "vocabulary": [],
+                    "grammar_notes": [],
+                    "comprehension_question_spanish": "",
+                    "difficulty": "B1",
+                }
+            ],
+        }
+        mock_resp = _fake_streaming_response(json.dumps(data, ensure_ascii=False))
+        with patch("infrastructure.ollama_client.session") as mock_session:
+            mock_session.post.return_value = mock_resp
+            result = translate_chunk(chunk="Hello world.", **_DEFAULT_KWARGS)
+        assert len(result.pairs) == 1
+        assert result.pairs[0].spanish == "Recomienda replantearlo como una diferencia de opinión."
+        assert not result.parse_warnings
+
 
 # ---------------------------------------------------------------------------
 # Error: connection failure

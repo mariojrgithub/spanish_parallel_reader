@@ -10,7 +10,7 @@ from typing import List, Literal
 import pandas as pd
 import requests
 import streamlit as st
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from text_processing import (
     RE_PAGE_NUM as _RE_PAGE_NUM,
     RE_HSPACE as _RE_HSPACE,
@@ -178,6 +178,17 @@ class ReadingPair(BaseModel):
     correction_note: str = Field(default="", exclude=True)
     correction_reason: str = Field(default="", exclude=True)
     original_spanish_before_correction: str = Field(default="", exclude=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_common_key_typos(cls, v: object) -> object:
+        """Normalize frequent model key typos before field validation."""
+        if isinstance(v, dict) and "spanish" not in v and isinstance(v.get("spanished"), str):
+            fixed = dict(v)
+            fixed["spanish"] = fixed.pop("spanished")
+            logger.warning("Normalized malformed pair key: 'spanished' -> 'spanish'.")
+            return fixed
+        return v
 
     @field_validator("difficulty", mode="before")
     @classmethod

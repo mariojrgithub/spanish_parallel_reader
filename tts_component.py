@@ -71,6 +71,11 @@ _TEMPLATE = """\
   function _isSpanish(tag){
     return _norm(tag).startsWith('es');
   }
+  // Latin American Spanish locale codes to prefer over Spain Spanish
+  var _latamLocales=['es-mx','es-ar','es-cl','es-co','es-pe','es-ve','es-uy','es-ec','es-bo','es-py','es-hn','es-sv','es-ni','es-cr','es-pa','es-do','es-cu'];
+  function _isLatinAmerican(lang){
+    return _latamLocales.indexOf(_norm(lang))>=0;
+  }
   // Neural (cloud) voices report localService===false in Chrome and are
   // dramatically higher quality than OS built-in voices.
   function _pickSpanishVoice(vv, preferred){
@@ -89,14 +94,26 @@ _TEMPLATE = """\
     });
     if(t2) return t2;
 
-    // Tier 3 — neural voice, any Spanish locale
+    // Tier 3 — neural voice, any Latin American Spanish locale (prefer over Spain)
     var t3=vv.find(function(x){
-      var xl=_norm(x.lang);
-      return !x.localService && _isSpanish(x.lang) && (xl===base || xl.startsWith(base+'-'));
+      return !x.localService && _isLatinAmerican(x.lang);
     });
     if(t3) return t3;
 
-    // Tier 4 — any Spanish voice
+    // Tier 4 — local voice, any Latin American Spanish locale
+    var t4=vv.find(function(x){
+      return _isLatinAmerican(x.lang);
+    });
+    if(t4) return t4;
+
+    // Tier 5 — neural voice, any Spanish locale (last resort before generic)
+    var t5=vv.find(function(x){
+      var xl=_norm(x.lang);
+      return !x.localService && _isSpanish(x.lang) && (xl===base || xl.startsWith(base+'-'));
+    });
+    if(t5) return t5;
+
+    // Tier 6 — any Spanish voice (fallback)
     return vv.find(function(x){ return _isSpanish(x.lang); }) || null;
   }
   function ttsspeak(){
