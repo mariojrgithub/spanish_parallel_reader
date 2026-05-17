@@ -8,6 +8,7 @@ Spanish Parallel Reader is a Streamlit application that turns English reading ma
 - Translate and align English text into Spanish at various CEFR levels
 - Vocabulary, grammar notes, literal translation, and comprehension questions
 - Output quality checker (deterministic and LLM-based)
+- Optional MongoDB-backed translation history with restore/delete/rename
 - Export study notes as Markdown
 - PDF, DOCX, TXT, and Markdown file support
 - Text-to-speech (browser-based)
@@ -53,6 +54,13 @@ Key environment variables:
 | `MAX_CHARS_PER_CHUNK` | `2200` | Max chars per translation chunk |
 | `TRANSLATION_CACHE_MAX_ENTRIES` | `50` | Translation cache size |
 | `TRANSLATION_INCLUDE_ENRICHMENTS` | `true` | Include vocab/grammar/literal |
+| `MONGO_ENABLED` | `true` | Enable MongoDB-backed translation history |
+| `MONGO_URI` | `mongodb://localhost:27017` locally / `mongodb://mongo:27017` in Docker | MongoDB connection string |
+| `MONGO_DB` | `spanish_parallel_reader` | MongoDB database name |
+| `MONGO_HISTORY_COLLECTION` | `translation_history` | MongoDB history collection |
+| `MONGO_USER_ID` | `default-user` | Logical user key for history partitioning |
+| `MONGO_HISTORY_LIMIT` | `25` | Max history entries shown in the UI |
+| `MONGO_SAVE_SOURCE_TEXT` | `true` | Persist cleaned source text for full UI restore |
 | `CHECKER_ENABLED` | `true` | Enable output checker |
 | `CHECKER_MODE` | `smart` | Checker mode (off/fast/smart/strict) |
 | `CHECKER_REQUIRE_PASS` | `false` | Block export on checker fail |
@@ -105,7 +113,7 @@ See `.env.example` for all options and documentation.
 5. To run the app in Docker but use your Mac's Ollama:
    ```bash
    docker compose -f docker-compose.mac.yml up --build
-   # This uses host.docker.internal:11434 for OLLAMA_HOST
+   # This uses host.docker.internal:11434 for OLLAMA_HOST and a local Mongo container by default
    ```
 6. Open http://localhost:8502 in your browser.
 
@@ -122,19 +130,19 @@ See `.env.example` for all options and documentation.
 ```bash
 docker compose up --build
 ```
-*This profile defaults to `qwen2.5:3b` for maximum compatibility on lower-memory systems. The 7B and 14B models are also available as options.*
+*This profile runs Ollama plus MongoDB in Docker. The 7B and 14B models are also available as options.*
 
 **With GPU:**
 ```bash
 docker compose -f docker-compose.gpu.yml up --build
 ```
-*This profile defaults to `qwen2.5:7b` for best quality/speed on GPU. The 3B and 14B models are also available as options.*
+*This profile keeps the existing GPU Ollama behavior and adds MongoDB persistence.*
 
 **On macOS with local Ollama:**
 ```bash
 docker compose -f docker-compose.mac.yml up --build
 ```
-*This profile defaults to `qwen2.5:7b` for best quality/speed. The 3B and 14B models are also available as options.*
+*This profile still uses host Ollama and now adds MongoDB in Docker by default. Override `MONGO_URI` if you prefer a host Mongo instance.*
 
 Open http://localhost:8502 in your browser.
 
@@ -144,8 +152,9 @@ Open http://localhost:8502 in your browser.
 2. Select your desired CEFR level, region, and translation style.
 3. Click "Translate".
 4. Review the Spanish output, vocabulary, grammar notes, and literal translation.
-5. Use the output checker to validate translations.
-6. Export study notes as Markdown.
+5. Use the History section to reload prior translations without re-running the model.
+6. Use the output checker to validate translations.
+7. Export study notes as Markdown.
 
 ## Testing and Quality Checks
 

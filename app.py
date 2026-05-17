@@ -45,6 +45,11 @@ from infrastructure.ollama_client import (
     session as _http_session,
     stream_chat as _ollama_stream,
 )
+from infrastructure.translation_history import (
+    MongoTranslationHistoryStore,
+    build_history_document,
+    build_session_restore_state,
+)
 from tts_component import render_tts_button
 
 logging.basicConfig(
@@ -67,6 +72,8 @@ _AVAILABLE_MODELS_RAW = os.getenv(
 AVAILABLE_OLLAMA_MODELS: List[str] = [
     m.strip() for m in _AVAILABLE_MODELS_RAW.split(",") if m.strip()
 ]
+if not AVAILABLE_OLLAMA_MODELS:
+    AVAILABLE_OLLAMA_MODELS = [OLLAMA_MODEL]
 _keep_alive_raw = os.getenv("OLLAMA_KEEP_ALIVE", "-1")
 try:
     OLLAMA_KEEP_ALIVE: int = int(_keep_alive_raw)
@@ -444,6 +451,65 @@ if "_enrich_idx" not in st.session_state:
 if "_spanish_focus_idx" not in st.session_state:
     st.session_state._spanish_focus_idx = 0
 
+_env_include_enrichments_default = os.getenv(
+    "TRANSLATION_INCLUDE_ENRICHMENTS", "true"
+).strip().lower() not in ("false", "0", "no", "off")
+_env_checker_enabled_default = os.getenv(
+    "CHECKER_ENABLED", "true"
+).strip().lower() not in ("false", "0", "no", "off")
+_env_checker_mode_default = os.getenv("CHECKER_MODE", "smart").strip().lower() or "smart"
+_env_checker_llm_default = os.getenv(
+    "CHECKER_LLM_ENABLED", "true"
+).strip().lower() not in ("false", "0", "no", "off")
+_env_checker_require_pass_default = os.getenv(
+    "CHECKER_REQUIRE_PASS", "false"
+).strip().lower() not in ("false", "0", "no", "off")
+_env_checker_detailed_default = os.getenv(
+    "CHECKER_DETAILED_DIAGNOSTICS", "false"
+).strip().lower() not in ("false", "0", "no", "off")
+_default_model_choice = (
+    OLLAMA_MODEL if OLLAMA_MODEL in AVAILABLE_OLLAMA_MODELS else AVAILABLE_OLLAMA_MODELS[0]
+)
+
+_session_defaults = {
+    "settings_mode": "Simple",
+    "selected_model": _default_model_choice,
+    "input_mode": "Paste text",
+    "level": "B1 intermediate",
+    "region": "Neutral",
+    "style": "Learner-friendly Spanish",
+    "fidelity": "Balanced",
+    "max_chars": DEFAULT_MAX_CHARS,
+    "chunks_to_process": 2,
+    "temperature": OLLAMA_TEMPERATURE,
+    "show_audio_controls": True,
+    "skip_enrichments": not _env_include_enrichments_default,
+    "include_literal": False,
+    "include_vocab": True,
+    "include_grammar": True,
+    "checker_enabled_ui": _env_checker_enabled_default,
+    "checker_mode_ui": _env_checker_mode_default,
+    "checker_require_pass_ui": _env_checker_require_pass_default,
+    "checker_model_ui": os.getenv("CHECKER_MODEL", "").strip(),
+    "checker_llm_ui": _env_checker_llm_default,
+    "checker_detailed_ui": _env_checker_detailed_default,
+    "start_chunk": 1,
+    "source_text_input": "",
+    "history_selected_id": "",
+    "history_rename_value": "",
+    "_history_selected_id_prev": "",
+    "_history_current_id": "",
+    "_history_current_label": "",
+    "_history_current_session_hash": "",
+    "_history_current_source_hash": "",
+    "_history_loaded_notice": "",
+    "_source_uploaded_filename": "",
+}
+
+for _state_key, _state_value in _session_defaults.items():
+    if _state_key not in st.session_state:
+        st.session_state[_state_key] = _state_value
+
 
 # -----------------------------
 # Text helpers
@@ -455,7 +521,280 @@ def set_source_text(text: str) -> None:
     if cleaned != st.session_state.raw_text:
         st.session_state.raw_text = cleaned
         st.session_state.results = []
+        st.session_state.checker_results = {}
         st.session_state._translation_cache.clear()
+        _invalidate_export_caches()
+        _clear_loaded_history_tracking()
+
+
+def _invalidate_export_caches() -> None:
+    st.session_state._cached_markdown_key = None
+    st.session_state._cached_markdown = None
+    st.session_state.pop("_cached_extra_exports_key", None)
+    st.session_state.pop("_cached_bilingual_csv", None)
+    st.session_state.pop("_cached_spanish_text", None)
+    st.session_state.pop("_cached_anki_csv", None)
+
+
+def _clear_loaded_history_tracking() -> None:
+    st.session_state._history_current_id = ""
+    st.session_state._history_current_label = ""
+    st.session_state._history_current_session_hash = ""
+    st.session_state._history_current_source_hash = ""
+
+
+def _reset_study_controls() -> None:
+    st.session_state.reader_search = ""
+    st.session_state.reader_corrected_only = False
+    st.session_state.reader_difficulty_filter = []
+    st.session_state.pop("spanish_first_mode", None)
+    st.session_state._spanish_focus_idx = 0
+    st.session_state._enrich_idx = None
+
+
+def _clear_current_lesson(*, clear_source: bool) -> None:
+    if clear_source:
+        st.session_state.raw_text = ""
+        st.session_state.source_text_input = ""
+        st.session_state._source_uploaded_filename = ""
+    st.session_state.results = []
+    st.session_state.checker_results = {}
+    st.session_state._translation_cache.clear()
+    _invalidate_export_caches()
+    _reset_study_controls()
+    st.session_state.pop("_last_upload_key", None)
+    _clear_loaded_history_tracking()
+
+
+@st.cache_resource
+def get_history_store() -> MongoTranslationHistoryStore:
+    return MongoTranslationHistoryStore()
+
+
+def _history_option_label(item: dict) -> str:
+    updated_at = item.get("updated_at")
+    if hasattr(updated_at, "strftime"):
+        updated_label = updated_at.strftime("%Y-%m-%d %H:%M")
+    else:
+        updated_label = str(updated_at or "")
+    details = [
+        item.get("label") or item.get("title") or "Untitled",
+        f"{item.get('pair_count', 0)} passages",
+        item.get("model") or "model unknown",
+        updated_label or "no timestamp",
+    ]
+    preview = item.get("source_preview") or ""
+    return " | ".join(part for part in details if part) + (f" | {preview}" if preview else "")
+
+
+def _apply_history_restore(restore_state: dict[str, object]) -> None:
+    _clear_current_lesson(clear_source=False)
+    st.session_state.raw_text = str(restore_state.get("raw_text", ""))
+    st.session_state.results = list(restore_state.get("results", []))
+    st.session_state.checker_results = dict(restore_state.get("checker_results", {}))
+    st.session_state.source_text_input = st.session_state.raw_text
+    st.session_state.input_mode = str(restore_state.get("input_mode", "Paste text")) or "Paste text"
+    st.session_state._source_uploaded_filename = str(
+        restore_state.get("history_uploaded_filename", "")
+    )
+    _reset_study_controls()
+
+    translation_settings = dict(restore_state.get("translation_settings", {}))
+    checker_settings_state = dict(restore_state.get("checker_settings", {}))
+
+    restored_model = str(translation_settings.get("selected_model", st.session_state.selected_model))
+    st.session_state.selected_model = restored_model or st.session_state.selected_model
+    st.session_state.level = str(translation_settings.get("level", st.session_state.level))
+    st.session_state.region = str(translation_settings.get("region", st.session_state.region))
+    st.session_state.style = str(translation_settings.get("style", st.session_state.style))
+    st.session_state.fidelity = str(translation_settings.get("fidelity", st.session_state.fidelity))
+    st.session_state.temperature = float(
+        translation_settings.get("temperature", st.session_state.temperature)
+    )
+    st.session_state.max_chars = int(translation_settings.get("max_chars", st.session_state.max_chars))
+    st.session_state.start_chunk = max(
+        1,
+        int(translation_settings.get("start_chunk", st.session_state.start_chunk)),
+    )
+    st.session_state.chunks_to_process = max(
+        1,
+        int(translation_settings.get("chunks_to_process", st.session_state.chunks_to_process)),
+    )
+    st.session_state.include_literal = bool(
+        translation_settings.get("include_literal", st.session_state.include_literal)
+    )
+    st.session_state.include_vocab = bool(
+        translation_settings.get("include_vocab", st.session_state.include_vocab)
+    )
+    st.session_state.include_grammar = bool(
+        translation_settings.get("include_grammar", st.session_state.include_grammar)
+    )
+    st.session_state.skip_enrichments = bool(
+        translation_settings.get(
+            "skip_enrichments",
+            not (
+                st.session_state.include_literal
+                or st.session_state.include_vocab
+                or st.session_state.include_grammar
+            ),
+        )
+    )
+    st.session_state.show_audio_controls = bool(
+        translation_settings.get(
+            "show_audio_controls",
+            st.session_state.show_audio_controls,
+        )
+    )
+
+    st.session_state.checker_enabled_ui = bool(
+        checker_settings_state.get("enabled", st.session_state.checker_enabled_ui)
+    )
+    st.session_state.checker_mode_ui = str(
+        checker_settings_state.get("mode", st.session_state.checker_mode_ui)
+    )
+    st.session_state.checker_model_ui = str(
+        checker_settings_state.get("checker_model", st.session_state.checker_model_ui)
+    )
+    st.session_state.checker_require_pass_ui = bool(
+        checker_settings_state.get(
+            "require_pass_before_export",
+            st.session_state.checker_require_pass_ui,
+        )
+    )
+    st.session_state.checker_detailed_ui = bool(
+        checker_settings_state.get(
+            "detailed_diagnostics",
+            st.session_state.checker_detailed_ui,
+        )
+    )
+    st.session_state.checker_llm_ui = bool(
+        checker_settings_state.get(
+            "llm_checker_enabled",
+            st.session_state.checker_llm_ui,
+        )
+    )
+
+    st.session_state._history_current_id = str(restore_state.get("history_document_id", ""))
+    st.session_state._history_current_label = str(restore_state.get("history_label", ""))
+    st.session_state._history_current_session_hash = str(
+        restore_state.get("history_session_hash", "")
+    )
+    st.session_state._history_current_source_hash = str(
+        restore_state.get("history_source_hash", "")
+    )
+
+
+def _build_translation_settings_snapshot(
+    *,
+    input_mode: str,
+    selected_model: str,
+    level: str,
+    region: str,
+    style: str,
+    fidelity: str,
+    temperature: float,
+    max_chars: int,
+    start_chunk: int,
+    chunks_to_process: int,
+    include_literal: bool,
+    include_vocab: bool,
+    include_grammar: bool,
+    skip_enrichments: bool,
+    show_audio_controls: bool,
+) -> dict[str, object]:
+    return {
+        "input_mode": input_mode,
+        "selected_model": selected_model,
+        "level": level,
+        "region": region,
+        "style": style,
+        "fidelity": fidelity,
+        "temperature": float(temperature),
+        "max_chars": int(max_chars),
+        "start_chunk": int(start_chunk),
+        "chunks_to_process": int(chunks_to_process),
+        "chunks_processed": len(st.session_state.results),
+        "include_literal": bool(include_literal),
+        "include_vocab": bool(include_vocab),
+        "include_grammar": bool(include_grammar),
+        "skip_enrichments": bool(skip_enrichments),
+        "show_audio_controls": bool(show_audio_controls),
+    }
+
+
+def _build_checker_settings_snapshot(checker_settings) -> dict[str, object]:
+    return {
+        "enabled": bool(checker_settings.enabled),
+        "mode": checker_settings.mode,
+        "checker_model": checker_settings.model,
+        "require_pass_before_export": bool(checker_settings.require_pass),
+        "detailed_diagnostics": bool(checker_settings.detailed_diagnostics),
+        "llm_checker_enabled": bool(checker_settings.llm_enabled),
+    }
+
+
+def _save_history_snapshot(
+    history_store: MongoTranslationHistoryStore,
+    *,
+    input_mode: str,
+    selected_model: str,
+    level: str,
+    region: str,
+    style: str,
+    fidelity: str,
+    temperature: float,
+    max_chars: int,
+    start_chunk: int,
+    chunks_to_process: int,
+    include_literal: bool,
+    include_vocab: bool,
+    include_grammar: bool,
+    skip_enrichments: bool,
+    show_audio_controls: bool,
+    checker_settings,
+) -> None:
+    if not history_store.enabled or not st.session_state.results:
+        return
+
+    document = build_history_document(
+        user_id=history_store.user_id,
+        source_text=st.session_state.raw_text,
+        input_mode=input_mode,
+        uploaded_filename=st.session_state.get("_source_uploaded_filename", ""),
+        results=st.session_state.results,
+        checker_results=st.session_state.checker_results,
+        translation_settings=_build_translation_settings_snapshot(
+            input_mode=input_mode,
+            selected_model=selected_model,
+            level=level,
+            region=region,
+            style=style,
+            fidelity=fidelity,
+            temperature=temperature,
+            max_chars=max_chars,
+            start_chunk=start_chunk,
+            chunks_to_process=chunks_to_process,
+            include_literal=include_literal,
+            include_vocab=include_vocab,
+            include_grammar=include_grammar,
+            skip_enrichments=skip_enrichments,
+            show_audio_controls=show_audio_controls,
+        ),
+        checker_settings=_build_checker_settings_snapshot(checker_settings),
+        label=st.session_state.get("_history_current_label", ""),
+        save_source_text=history_store.save_source_text,
+    )
+    saved_document = history_store.save_history(
+        document,
+        preferred_history_id=st.session_state.get("_history_current_id", ""),
+    )
+    if saved_document:
+        st.session_state._history_current_id = saved_document.get("_id", "")
+        st.session_state._history_current_label = saved_document.get(
+            "label", st.session_state.get("_history_current_label", "")
+        )
+        st.session_state._history_current_session_hash = saved_document.get("session_hash", "")
+        st.session_state._history_current_source_hash = saved_document.get("source_hash", "")
 
 def tts_lang_from_region(region: str) -> str:
     """Map app translation preference to a Spanish TTS locale."""
@@ -1455,6 +1794,108 @@ def _render_corrections_tab(
                 st.caption(f"Checker: {check_result.user_facing_summary}")
 
 
+history_store = get_history_store()
+history_items = history_store.list_history()
+history_items_by_id = {item.get("_id", ""): item for item in history_items if item.get("_id")}
+
+st.subheader("0. History")
+_history_cols = st.columns([4, 0.8, 0.8, 1.2])
+with _history_cols[0]:
+    history_options = [""] + [item["_id"] for item in history_items if item.get("_id")]
+    st.selectbox(
+        "Saved translations",
+        history_options,
+        key="history_selected_id",
+        format_func=lambda item_id: (
+            "Select a saved translation"
+            if not item_id
+            else _history_option_label(history_items_by_id.get(item_id, {}))
+        ),
+    )
+selected_history = history_items_by_id.get(st.session_state.history_selected_id, {})
+if st.session_state.get("_history_selected_id_prev") != st.session_state.history_selected_id:
+    st.session_state.history_rename_value = selected_history.get("label", "") if selected_history else ""
+    st.session_state._history_selected_id_prev = st.session_state.history_selected_id
+with _history_cols[1]:
+    st.write("")
+    history_load_clicked = st.button(
+        "Load",
+        key="history_load_button",
+        disabled=not st.session_state.history_selected_id,
+    )
+with _history_cols[2]:
+    st.write("")
+    history_delete_clicked = st.button(
+        "Delete",
+        key="history_delete_button",
+        disabled=not st.session_state.history_selected_id,
+    )
+with _history_cols[3]:
+    st.text_input(
+        "Rename label",
+        key="history_rename_value",
+        placeholder="Optional label",
+        disabled=not st.session_state.history_selected_id,
+    )
+history_rename_clicked = st.button(
+    "Rename",
+    key="history_rename_button",
+    disabled=not st.session_state.history_selected_id or not st.session_state.history_rename_value.strip(),
+)
+
+if history_load_clicked and st.session_state.history_selected_id:
+    loaded_history = history_store.load_history(st.session_state.history_selected_id)
+    if loaded_history:
+        _apply_history_restore(
+            build_session_restore_state(
+                loaded_history,
+                translation_response_cls=TranslationResponse,
+                reading_pair_cls=ReadingPair,
+                vocabulary_item_cls=VocabularyItem,
+                pair_check_result_cls=PairCheckResult,
+            )
+        )
+        st.session_state._history_loaded_notice = (
+            f"Loaded {loaded_history.get('label') or loaded_history.get('title') or 'saved translation'}."
+        )
+        st.rerun()
+    else:
+        st.warning("Could not load the selected history entry.")
+
+if history_delete_clicked and st.session_state.history_selected_id:
+    if history_store.delete_history(st.session_state.history_selected_id):
+        if st.session_state._history_current_id == st.session_state.history_selected_id:
+            _clear_loaded_history_tracking()
+        st.session_state.history_selected_id = ""
+        st.session_state.history_rename_value = ""
+        st.session_state._history_loaded_notice = "History entry deleted."
+        st.rerun()
+    else:
+        st.warning("Could not delete the selected history entry.")
+
+if history_rename_clicked and st.session_state.history_selected_id:
+    if history_store.rename_history(
+        st.session_state.history_selected_id,
+        st.session_state.history_rename_value.strip(),
+    ):
+        if st.session_state._history_current_id == st.session_state.history_selected_id:
+            st.session_state._history_current_label = st.session_state.history_rename_value.strip()
+        st.session_state._history_loaded_notice = "History label updated."
+        st.rerun()
+    else:
+        st.warning("Could not rename the selected history entry.")
+
+if st.session_state._history_loaded_notice:
+    st.caption(st.session_state._history_loaded_notice)
+
+if st.session_state._history_current_label:
+    st.caption(f"Current history entry: {st.session_state._history_current_label}")
+elif history_store.enabled and not history_items:
+    st.caption("MongoDB history is enabled, but no saved translations exist yet.")
+else:
+    st.caption(history_store.status_message())
+
+
 def _render_checker_details(
     result: PairCheckResult,
     detailed: bool,
@@ -1589,13 +2030,17 @@ with st.sidebar:
         "Settings mode",
         ["Simple", "Advanced"],
         horizontal=True,
+        key="settings_mode",
         help="Simple keeps learner-friendly controls visible. Advanced shows model tuning and checker internals.",
     )
     _advanced_mode = settings_mode == "Advanced"
 
+    _model_options = list(AVAILABLE_OLLAMA_MODELS)
+    if st.session_state.selected_model not in _model_options:
+        _model_options.insert(0, st.session_state.selected_model)
     _default_idx = (
-        AVAILABLE_OLLAMA_MODELS.index(OLLAMA_MODEL)
-        if OLLAMA_MODEL in AVAILABLE_OLLAMA_MODELS
+        _model_options.index(st.session_state.selected_model)
+        if st.session_state.selected_model in _model_options
         else 0
     )
 
@@ -1603,16 +2048,13 @@ with st.sidebar:
         st.write("**Model**")
         selected_model = st.selectbox(
             "Ollama model",
-            AVAILABLE_OLLAMA_MODELS,
+            _model_options,
             index=_default_idx,
+            key="selected_model",
             help="qwen2.5:3b is fastest on CPU. qwen2.5:7b is the default. qwen2.5:14b is highest quality.",
         )
     else:
-        selected_model = (
-            OLLAMA_MODEL
-            if OLLAMA_MODEL in AVAILABLE_OLLAMA_MODELS
-            else AVAILABLE_OLLAMA_MODELS[_default_idx]
-        )
+        selected_model = st.session_state.selected_model
 
     _check_started = time.monotonic()
     ok, status = check_ollama(selected_model)
@@ -1660,6 +2102,7 @@ with st.sidebar:
             "Paste text",
             "Upload file",
         ],
+        key="input_mode",
     )
 
     level = st.selectbox(
@@ -1672,6 +2115,7 @@ with st.sidebar:
             "C1 advanced",
         ],
         index=2,
+        key="level",
     )
 
     region = st.selectbox(
@@ -1682,6 +2126,7 @@ with st.sidebar:
             "European / Spain",
         ],
         index=0,
+        key="region",
     )
     tts_lang = tts_lang_from_region(region)
 
@@ -1695,6 +2140,7 @@ with st.sidebar:
             "Journalistic when appropriate",
         ],
         index=1,
+        key="style",
     )
 
     fidelity = st.selectbox(
@@ -1706,6 +2152,7 @@ with st.sidebar:
             "Preserve literary style",
         ],
         index=0,
+        key="fidelity",
     )
 
     if _advanced_mode:
@@ -1714,15 +2161,24 @@ with st.sidebar:
             if _is_qwen25_3b_model(selected_model)
             else 4000
         )
+        st.session_state.max_chars = min(
+            max(800, int(st.session_state.max_chars)),
+            _chunk_upper_bound,
+        )
         max_chars = st.slider(
             "Max characters per chunk",
             800,
             _chunk_upper_bound,
-            min(DEFAULT_MAX_CHARS, _chunk_upper_bound),
+            min(int(st.session_state.max_chars), _chunk_upper_bound),
             step=100,
+            key="max_chars",
         )
     else:
-        max_chars = DEFAULT_MAX_CHARS
+        if _is_qwen25_3b_model(selected_model):
+            st.session_state.max_chars = min(
+                int(st.session_state.max_chars), QWEN25_3B_SAFE_MAX_CHARS
+            )
+        max_chars = int(st.session_state.max_chars)
 
     if _is_qwen25_3b_model(selected_model):
         if max_chars > QWEN25_3B_SAFE_MAX_CHARS:
@@ -1737,7 +2193,8 @@ with st.sidebar:
         "Chunks to process",
         1,
         10,
-        2,
+        min(max(1, int(st.session_state.chunks_to_process)), 10),
+        key="chunks_to_process",
     )
 
     if _advanced_mode:
@@ -1745,25 +2202,23 @@ with st.sidebar:
             "Model temperature",
             0.0,
             0.3,
-            OLLAMA_TEMPERATURE,
+            float(st.session_state.temperature),
             step=0.05,
+            key="temperature",
             help="Lower = more consistent JSON output. Keep below 0.3 for reliable structured translation.",
         )
     else:
-        temperature = OLLAMA_TEMPERATURE
+        temperature = float(st.session_state.temperature)
 
     show_audio_controls = st.checkbox(
         "Show audio controls",
-        value=True,
+        key="show_audio_controls",
         help="Hide play buttons if you want a cleaner reading view.",
     )
 
-    _env_include_enrichments = os.getenv(
-        "TRANSLATION_INCLUDE_ENRICHMENTS", "true"
-    ).strip().lower() not in ("false", "0", "no", "off")
     _skip_enrichments = st.checkbox(
         "⚡ Skip enrichments (faster)",
-        value=not _env_include_enrichments,
+        key="skip_enrichments",
         help=(
             "Skip literal Spanish, vocabulary, and grammar notes. "
             "The model returns only English + Spanish pairs, which is significantly faster. "
@@ -1771,11 +2226,16 @@ with st.sidebar:
         ),
     )
 
-
-    include_literal = False
+    include_literal = st.checkbox(
+        "Include literal Spanish",
+        key="include_literal",
+        disabled=_skip_enrichments,
+    )
+    if _skip_enrichments:
+        include_literal = False
     include_vocab = st.checkbox(
         "Include vocabulary",
-        value=True,
+        key="include_vocab",
         disabled=_skip_enrichments,
     )
     if _skip_enrichments:
@@ -1783,7 +2243,7 @@ with st.sidebar:
 
     include_grammar = st.checkbox(
         "Include grammar notes",
-        value=True,
+        key="include_grammar",
         disabled=_skip_enrichments,
     )
     if _skip_enrichments:
@@ -1798,34 +2258,22 @@ with st.sidebar:
     with st.expander("🔍 Output Checker"):
         # Derive sidebar defaults from env vars so Docker/local overrides take effect
         # on first render. Subsequent renders use Streamlit's widget session state.
-        _env_checker_enabled = os.getenv("CHECKER_ENABLED", "true").strip().lower() not in (
-            "false", "0", "no", "off"
-        )
-        _env_checker_mode = os.getenv("CHECKER_MODE", "smart").strip().lower()
         _checker_mode_options = ["instant", "off", "fast", "smart", "strict"]
-        _env_checker_mode_idx = (
-            _checker_mode_options.index(_env_checker_mode)
-            if _env_checker_mode in _checker_mode_options
+        _checker_mode_idx = (
+            _checker_mode_options.index(st.session_state.checker_mode_ui)
+            if st.session_state.checker_mode_ui in _checker_mode_options
             else 3  # default to smart
-        )
-        _env_checker_llm = os.getenv("CHECKER_LLM_ENABLED", "true").strip().lower() not in (
-            "false", "0", "no", "off"
-        )
-        _env_checker_require_pass = os.getenv("CHECKER_REQUIRE_PASS", "false").strip().lower() not in (
-            "false", "0", "no", "off"
-        )
-        _env_checker_detailed = os.getenv("CHECKER_DETAILED_DIAGNOSTICS", "false").strip().lower() not in (
-            "false", "0", "no", "off"
         )
 
         checker_enabled_ui = st.checkbox(
             "Enable output checker",
-            value=_env_checker_enabled,
+            key="checker_enabled_ui",
         )
         checker_mode_ui = st.selectbox(
             "Checker mode",
             _checker_mode_options,
-            index=_env_checker_mode_idx,
+            index=_checker_mode_idx,
+            key="checker_mode_ui",
             help=(
                 "instant: translate and show immediately, no checker.\n"
                 "off: no checks.\n"
@@ -1836,51 +2284,32 @@ with st.sidebar:
         )
         checker_require_pass_ui = st.checkbox(
             "Require checker pass before export",
-            value=_env_checker_require_pass,
+            key="checker_require_pass_ui",
             help="Block Markdown export for pairs that fail the checker.",
         )
-        checker_model_ui = ""
-        checker_llm_ui = _env_checker_llm
-        checker_detailed_ui = _env_checker_detailed
+        checker_model_ui = st.session_state.checker_model_ui
+        checker_llm_ui = st.session_state.checker_llm_ui
+        checker_detailed_ui = st.session_state.checker_detailed_ui
         if _advanced_mode:
             checker_model_ui = st.text_input(
                 "Checker model",
-                value="",
                 placeholder="defaults to translation model",
+                key="checker_model_ui",
                 help="Leave blank to use the same model as translation. Set CHECKER_MODEL in .env to make it persistent.",
             )
             checker_llm_ui = st.checkbox(
                 "LLM checker enabled",
-                value=_env_checker_llm,
+                key="checker_llm_ui",
                 help="Uncheck to use deterministic checks only (no additional model calls).",
             )
             checker_detailed_ui = st.checkbox(
                 "Show detailed diagnostics",
-                value=_env_checker_detailed,
+                key="checker_detailed_ui",
                 help="Show per-issue breakdown. Keep off for a faster, cleaner UI.",
             )
 
     if st.button("Clear session"):
-        set_source_text("")
-        st.session_state.checker_results = {}
-        st.session_state._translation_cache.clear()
-        
-        st.session_state._cached_markdown_key = None
-        st.session_state._cached_markdown = None
-        st.session_state.pop("_cached_extra_exports_key", None)
-        st.session_state.pop("_cached_bilingual_csv", None)
-        st.session_state.pop("_cached_spanish_text", None)
-        st.session_state.pop("_cached_anki_csv", None)
-        st.session_state._enrich_idx = None
-        st.session_state._spanish_focus_idx = 0
-
-        # Reset Study UI controls.
-        st.session_state.reader_search = ""
-        st.session_state.reader_corrected_only = False
-        st.session_state.reader_difficulty_filter = []
-        st.session_state.pop("spanish_first_mode", None)
-
-        st.session_state.pop("_last_upload_key", None)
+        _clear_current_lesson(clear_source=True)
         st.rerun()
 
 # -----------------------------
@@ -1914,8 +2343,10 @@ if input_mode == "Paste text":
         "Paste English text",
         height=280,
         placeholder="Paste a chapter excerpt, essay, article, or other English text...",
+        key="source_text_input",
     )
 
+    st.session_state._source_uploaded_filename = ""
     set_source_text(pasted)
 
     if pasted:
@@ -1950,6 +2381,7 @@ else:
                         set_source_text(extract_docx_text(uploaded))
                     else:
                         set_source_text(extract_plain_text(uploaded))
+                st.session_state._source_uploaded_filename = uploaded.name
                 st.session_state["_last_upload_key"] = _upload_key
                 st.success(
                     f"Extracted {len(st.session_state.raw_text):,} characters"
@@ -1959,7 +2391,10 @@ else:
             except Exception as exc:
                 st.error(f"Could not extract text: {exc}")
         else:
+            st.session_state._source_uploaded_filename = uploaded.name
             st.success(f"Extracted {len(st.session_state.raw_text):,} characters")
+    elif st.session_state._source_uploaded_filename:
+        st.caption(f"Loaded source file: {st.session_state._source_uploaded_filename}")
 
 
 chunks = (
@@ -2006,7 +2441,8 @@ start_index = st.number_input(
         len(chunks),
         1,
     ),
-    value=1,
+    value=min(max(1, int(st.session_state.start_chunk)), max(len(chunks), 1)),
+    key="start_chunk",
 )
 
 # Chunk preview — show content boundaries so the user knows what they're selecting
@@ -2059,7 +2495,7 @@ _translate_clicked = st.button(
 _checker_changed_translation = False
 
 if _translate_clicked:
-    st.session_state._cached_markdown_key = None  # invalidate cached export
+    _invalidate_export_caches()
 
     start = int(start_index) - 1
     selected_chunks = chunks[start : start + chunks_to_process]
@@ -2438,6 +2874,27 @@ if _translate_clicked:
     else:
         st.caption(f"Workflow time: {_workflow_elapsed:.1f}s")
 
+    if st.session_state.results and len(failed_chunks) < _n_chunks:
+        _save_history_snapshot(
+            history_store,
+            input_mode=input_mode,
+            selected_model=selected_model,
+            level=level,
+            region=region,
+            style=style,
+            fidelity=fidelity,
+            temperature=temperature,
+            max_chars=max_chars,
+            start_chunk=int(start_index),
+            chunks_to_process=chunks_to_process,
+            include_literal=include_literal,
+            include_vocab=include_vocab,
+            include_grammar=include_grammar,
+            skip_enrichments=_skip_enrichments,
+            show_audio_controls=show_audio_controls,
+            checker_settings=checker_settings,
+        )
+
 
 
     # Force Streamlit into the normal post-translation render.
@@ -2509,8 +2966,26 @@ if (
                         st.session_state.checker_results[_new_ck] = _new_cr
 
                 st.session_state.results[_eidx] = _merged_enriched
-                st.session_state._cached_markdown_key = None
-                st.session_state._cached_markdown = None
+                _invalidate_export_caches()
+                _save_history_snapshot(
+                    history_store,
+                    input_mode=input_mode,
+                    selected_model=selected_model,
+                    level=level,
+                    region=region,
+                    style=style,
+                    fidelity=fidelity,
+                    temperature=temperature,
+                    max_chars=max_chars,
+                    start_chunk=int(start_index),
+                    chunks_to_process=chunks_to_process,
+                    include_literal=True,
+                    include_vocab=True,
+                    include_grammar=True,
+                    skip_enrichments=False,
+                    show_audio_controls=show_audio_controls,
+                    checker_settings=checker_settings,
+                )
 
             except Exception as _enrich_exc:
                 st.error(f"Enrichment failed: {_enrich_exc}")
