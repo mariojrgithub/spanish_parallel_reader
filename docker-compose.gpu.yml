@@ -1,4 +1,19 @@
 services:
+  mongo:
+    image: mongo:7.0
+    container_name: spanish-reader-mongo
+    restart: unless-stopped
+    ports:
+      - "${MONGO_HOST_PORT:-27017}:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "mongodb://localhost:27017/admin", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 10
+
   ollama:
     image: ollama/ollama:0.23.2
     container_name: spanish-reader-ollama
@@ -47,6 +62,8 @@ services:
     container_name: spanish-parallel-reader
     restart: unless-stopped
     depends_on:
+      mongo:
+        condition: service_healthy
       ollama:
         condition: service_healthy
       ollama-pull:
@@ -65,6 +82,13 @@ services:
       MAX_CHARS_PER_CHUNK: ${MAX_CHARS_PER_CHUNK:-2200}
       TRANSLATION_CACHE_MAX_ENTRIES: ${TRANSLATION_CACHE_MAX_ENTRIES:-50}
       TRANSLATION_INCLUDE_ENRICHMENTS: ${TRANSLATION_INCLUDE_ENRICHMENTS:-true}
+      MONGO_ENABLED: ${MONGO_ENABLED:-true}
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: ${MONGO_DB:-spanish_parallel_reader}
+      MONGO_HISTORY_COLLECTION: ${MONGO_HISTORY_COLLECTION:-translation_history}
+      MONGO_USER_ID: ${MONGO_USER_ID:-default-user}
+      MONGO_HISTORY_LIMIT: ${MONGO_HISTORY_LIMIT:-25}
+      MONGO_SAVE_SOURCE_TEXT: ${MONGO_SAVE_SOURCE_TEXT:-true}
       CHECKER_ENABLED: ${CHECKER_ENABLED:-true}
       # smart: deterministic + LLM for risky/sampled pairs. GPU has the compute for it.
       CHECKER_MODE: ${CHECKER_MODE:-smart}
@@ -92,3 +116,4 @@ services:
 
 volumes:
   ollama_models:
+  mongo_data:
