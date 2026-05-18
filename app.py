@@ -2114,7 +2114,6 @@ with st.sidebar:
             "B2 upper-intermediate",
             "C1 advanced",
         ],
-        index=2,
         key="level",
     )
 
@@ -2125,7 +2124,6 @@ with st.sidebar:
             "Latin American",
             "European / Spain",
         ],
-        index=0,
         key="region",
     )
     tts_lang = tts_lang_from_region(region)
@@ -2139,7 +2137,6 @@ with st.sidebar:
             "Literary when appropriate",
             "Journalistic when appropriate",
         ],
-        index=1,
         key="style",
     )
 
@@ -2151,7 +2148,6 @@ with st.sidebar:
             "Simpler learner wording",
             "Preserve literary style",
         ],
-        index=0,
         key="fidelity",
     )
 
@@ -2169,7 +2165,6 @@ with st.sidebar:
             "Max characters per chunk",
             800,
             _chunk_upper_bound,
-            min(int(st.session_state.max_chars), _chunk_upper_bound),
             step=100,
             key="max_chars",
         )
@@ -2193,7 +2188,6 @@ with st.sidebar:
         "Chunks to process",
         1,
         10,
-        min(max(1, int(st.session_state.chunks_to_process)), 10),
         key="chunks_to_process",
     )
 
@@ -2202,7 +2196,6 @@ with st.sidebar:
             "Model temperature",
             0.0,
             0.3,
-            float(st.session_state.temperature),
             step=0.05,
             key="temperature",
             help="Lower = more consistent JSON output. Keep below 0.3 for reliable structured translation.",
